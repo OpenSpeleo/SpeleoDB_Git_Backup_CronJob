@@ -1,0 +1,66 @@
+// For format details, see https://containers.dev/implementors/json_reference/
+{
+    "name": "speleodb_dev",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "workspaceFolder": "/workspace/",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/,type=bind",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "editor.formatOnSave": true,
+                "makefile.configureOnOpen": false,
+                "remote.autoForwardPorts": false,
+                "[python]": {
+                    "analysis.autoImportCompletions": true,
+                    "analysis.exclude": [
+                        "**/__pycache__",
+                        "**/.*",
+                        "**/*.egg-info",
+                        "**/build",
+                        "**/dist",
+                    ],
+                    "analysis.typeCheckingMode": "basic",
+                    "defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+                    "editor.codeActionsOnSave": {
+                        "source.organizeImports": "always"
+                    },
+                    "editor.defaultFormatter": "charliermarsh.ruff",
+                    "languageServer": "Pylance",
+                    "linting.enabled": true,
+                    "linting.flake8Enabled": true,
+                    "linting.mypyEnabled": true,
+                    "linting.mypyPath": "/usr/local/bin/mypy",
+                    "linting.pylintEnabled": true
+                }
+            },
+            "extensions": [
+                // Python
+                "ms-python.python",
+                // PyLance
+                "ms-python.vscode-pylance",
+                // Makefile Tools
+                "ms-vscode.makefile-tools",
+                // Makefile
+                "ms-vscode.makefile-tools",
+                // Markdown
+                "davidanson.vscode-markdownlint",
+                // Ruff
+                "charliermarsh.ruff",
+                // Env
+                "IronGeek.vscode-env"
+            ]
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "username": "speleodb_dev",
+            "installZsh": true,
+            "installOhMyZsh": true,
+            "configureZshAsDefaultShell": false,
+            "upgradePackages": false
+        }
+    }
+}
