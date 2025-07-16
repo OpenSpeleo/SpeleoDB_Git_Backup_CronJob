@@ -7,5 +7,4 @@ runtime = "V2"
 numReplicas = 1
 cronSchedule = "0 9 * * *"
 sleepApplication = false
-startCommand = "/root/.local/bin/uv run --quiet main.py"
 restartPolicyType = "NEVER"

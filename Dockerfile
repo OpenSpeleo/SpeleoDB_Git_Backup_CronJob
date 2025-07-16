@@ -18,4 +18,4 @@ WORKDIR /workspace
 
 ADD . /workspace/
 
-ENTRYPOINT ["/root/.local/bin/uv", "--quiet", "run", "main.py"]
+CMD ["/root/.local/bin/uv", "--quiet", "run", "main.py"]
