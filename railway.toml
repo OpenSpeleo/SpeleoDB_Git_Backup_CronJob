@@ -5,6 +5,6 @@ dockerfilePath = "Dockerfile"
 [deploy]
 runtime = "V2"
 numReplicas = 1
-cronSchedule = "0 * * * *"
+cronSchedule = "0/15 * * * *"
 sleepApplication = false
 restartPolicyType = "NEVER"

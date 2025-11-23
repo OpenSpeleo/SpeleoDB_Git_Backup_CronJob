@@ -1,10 +1,10 @@
 # /// script
-# requires-python = ">=3.13"
+# requires-python = ">=3.14"
 # dependencies = [
 #     "python-dotenv",
-#     "python-gitlab==6.1.0",
-#     "GitPython==3.1.44",
-#     "requests==2.32.4"
+#     "python-gitlab==7.0.0",
+#     "GitPython==3.1.45",
+#     "requests==2.32.5"
 # ]
 # ///
 """
@@ -271,6 +271,7 @@ class GitLabToGOGSBackup:
 
             # Backup each repository
             for idx, project in enumerate(projects):
+                logger.info("")  # Visual Spacing
                 # Get full project details
                 full_project = self.gl.projects.get(project.id)
 
