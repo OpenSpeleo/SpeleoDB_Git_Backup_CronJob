@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -129,6 +130,87 @@ class GitLabToGOGSBackup:
                 return None
 
         return None
+
+    def _is_retryable_clone_error(self, error: GitCommandError) -> bool:
+        """Determine whether a Git clone error appears transient."""
+        error_blob = " ".join(
+            str(part)
+            for part in (
+                getattr(error, "stderr", ""),
+                getattr(error, "stdout", ""),
+                str(error),
+            )
+        ).lower()
+
+        transient_markers = (
+            "rpc failed",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "http 429",
+            "remote end closed connection",
+            "remote end hung up unexpectedly",
+            "expected flush after ref listing",
+            "connection reset",
+            "connection timed out",
+            "operation timed out",
+            "tls handshake timeout",
+            "early eof",
+        )
+        return any(marker in error_blob for marker in transient_markers)
+
+    def _clone_repository_with_retry(
+        self, project: Any, destination_dir: str, retries: int = 5
+    ) -> Repo:
+        """Clone a GitLab repository with exponential backoff on transient failures."""
+        total_attempts = retries + 1
+        base_delay_seconds = 1
+        clone_path = os.path.join(destination_dir, "mirror-repo.git")  # noqa: PTH118
+        gitlab_url = project.http_url_to_repo.replace(
+            "https://", f"https://oauth2:{self.gitlab_token}@"
+        )
+
+        for attempt in range(1, total_attempts + 1):
+            # Ensure retries always start from a clean clone path.
+            shutil.rmtree(clone_path, ignore_errors=True)
+
+            try:
+                return Repo.clone_from(
+                    gitlab_url,
+                    clone_path,
+                    mirror=True,  # Clone as mirror to get all refs
+                )
+            except GitCommandError as e:
+                retryable = self._is_retryable_clone_error(e)
+                has_attempts_left = attempt < total_attempts
+
+                if not retryable:
+                    logger.exception(
+                        f"Non-retryable git clone error for {project.name}. "
+                        "Skipping retries."
+                    )
+                    raise
+
+                if has_attempts_left:
+                    delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Transient git clone error for {project.name} "
+                        f"(attempt {attempt}/{total_attempts}). Retrying in "
+                        f"{delay_seconds} seconds..."
+                    )
+                    logger.debug("Retryable clone exception details", exc_info=True)
+                    time.sleep(delay_seconds)
+                    continue
+
+                logger.exception(
+                    f"Exhausted retries while cloning {project.name} after "
+                    f"{total_attempts} attempts."
+                )
+                raise
+
+        msg = f"Unexpected clone retry state reached for {project.name}"
+        raise RuntimeError(msg)
 
     def _validate_config(self):
         """Validate that all required environment variables are set."""
@@ -263,14 +345,10 @@ class GitLabToGOGSBackup:
             try:
                 # Clone from GitLab
                 logger.info(f"Cloning {project.name} from GitLab...")
-                gitlab_url = project.http_url_to_repo.replace(
-                    "https://", f"https://oauth2:{self.gitlab_token}@"
-                )
-
-                repo = Repo.clone_from(
-                    gitlab_url,
+                repo = self._clone_repository_with_retry(
+                    project,
                     temp_dir,
-                    mirror=True,  # Clone as mirror to get all refs
+                    retries=5,
                 )
 
                 # Check if repo exists in GOGS, create if not

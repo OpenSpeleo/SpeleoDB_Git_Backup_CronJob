@@ -1,0 +1,26 @@
+---
+description: Core coding and reliability standards for the backup job
+alwaysApply: true
+---
+
+# SpeleoDB Backup Project Standards
+
+- Keep changes compatible with Python 3.14 and existing dependencies.
+- Prefer focused helper methods over large, deeply nested functions.
+- Use type hints for new non-trivial functions and methods.
+- Use `logging` for progress and failures; do not use `print`.
+- Never log sensitive credentials (tokens, auth URLs, passwords).
+- Treat external calls as failure-prone:
+  - Detect transient failures.
+  - Retry with exponential backoff.
+  - Log attempt number, delay, and final outcome.
+- Preserve resilience: one failed project must not abort other project backups.
+- Validate edits with linting and syntax checks before finishing.
+- Follow style conventions from `pyproject.toml` (Ruff settings, 88-char lines).
+
+## Required checks after code edits
+
+```bash
+uv run ruff check .
+PYTHONPYCACHEPREFIX=./.pycache python3 -m py_compile main.py
+```
