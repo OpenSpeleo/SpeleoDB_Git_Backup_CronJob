@@ -18,4 +18,6 @@ WORKDIR /workspace
 
 ADD . /workspace/
 
+RUN /root/.local/bin/uv sync --frozen
+
 CMD ["/root/.local/bin/uv", "--quiet", "run", "main.py"]

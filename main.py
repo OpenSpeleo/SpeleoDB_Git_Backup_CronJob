@@ -1,12 +1,3 @@
-# /// script
-# requires-python = ">=3.14"
-# dependencies = [
-#     "python-dotenv",
-#     "python-gitlab==7.0.0",
-#     "GitPython==3.1.45",
-#     "requests==2.32.5"
-# ]
-# ///
 """
 GitLab to GOGS Backup Script
 
@@ -20,6 +11,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from typing import Any
 
 import gitlab
@@ -78,6 +70,65 @@ class GitLabToGOGSBackup:
         # Verify GOGS organization exists if specified
         if self.gogs_org:
             self._verify_gogs_org_exists()
+
+    def _is_retryable_gitlab_error(self, error: Exception) -> bool:
+        """Determine whether a GitLab/API error should be retried."""
+        if isinstance(error, requests.exceptions.RequestException):
+            return True
+
+        if isinstance(error, gitlab.GitlabError):
+            response_code = getattr(error, "response_code", None)
+            # Retry common transient status codes.
+            if response_code in {408, 429, 500, 502, 503, 504}:
+                return True
+
+            error_name = type(error).__name__.lower()
+            if "connection" in error_name or "timeout" in error_name:
+                return True
+
+        return False
+
+    def _get_full_project_with_retry(
+        self, project_id: int, project_display_name: str, retries: int = 5
+    ) -> Any | None:
+        """Fetch full project details with exponential backoff."""
+        total_attempts = retries + 1
+        base_delay_seconds = 1
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return self.gl.projects.get(project_id)
+            except (gitlab.GitlabError, requests.exceptions.RequestException) as e:
+                retryable = self._is_retryable_gitlab_error(e)
+                has_attempts_left = attempt < total_attempts
+
+                if not retryable:
+                    logger.exception(
+                        f"Non-retryable error while loading project details for "
+                        f"'{project_display_name}' (id={project_id}). Skipping project."
+                    )
+                    return None
+
+                if has_attempts_left:
+                    delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"Transient error while loading project details for "
+                        f"'{project_display_name}' (id={project_id}) "
+                        f"(attempt {attempt}/{total_attempts}). Retrying in "
+                        f"{delay_seconds} seconds..."
+                    )
+                    logger.debug("Retryable exception details", exc_info=True)
+                    time.sleep(delay_seconds)
+                    continue
+
+                logger.exception(
+                    f"Exhausted retries while loading project details for "
+                    f"'{project_display_name}' (id={project_id}) after "
+                    f"{total_attempts} attempts. Skipping project."
+                )
+                return None
+
+        return None
 
     def _validate_config(self):
         """Validate that all required environment variables are set."""
@@ -272,8 +323,26 @@ class GitLabToGOGSBackup:
             # Backup each repository
             for idx, project in enumerate(projects):
                 logger.info("")  # Visual Spacing
-                # Get full project details
-                full_project = self.gl.projects.get(project.id)
+                project_display_name = (
+                    getattr(project, "path_with_namespace", None)
+                    or getattr(project, "name", None)
+                    or str(project.id)
+                )
+
+                # Get full project details with retries for transient failures
+                full_project = self._get_full_project_with_retry(
+                    project.id,
+                    project_display_name,
+                    retries=5,
+                )
+                if full_project is None:
+                    failed.append(
+                        (
+                            project_display_name,
+                            "Failed to load project details after retries",
+                        )
+                    )
+                    continue
 
                 logger.info(
                     f"[{idx + 1:03d}/{len(projects):03d}] Starting backup of "

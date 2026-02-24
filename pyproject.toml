@@ -1,3 +1,25 @@
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+  "prek>=0.3.3,<0.4",
+  "ruff>=0.14,<0.15",
+]
+
+[project]
+name = "SpeleoDB_GIT_Backup_Cronjob"
+version = "1.0.0"
+authors = [{ name = "Jonathan Dekhtiar", email = "jonathan@dekhtiar.com" }]
+readme = "README.md"
+dependencies = [
+    "python-dotenv>=1.2.0,<1.3.0",
+    "python-gitlab>=8.0.0,<9.0.0",
+    "GitPython>=3.1.46,<3.2",
+    "requests>=2.32,<2.33"
+]
+requires-python = ">=3.14"
+
 [tool.isort]
 profile = "black"
 
@@ -120,7 +142,7 @@ ignore = [
     # Deactivated because it can make the code slow:
     # https://github.com/astral-sh/ruff/issues/7871
     "C901", # Checks for function definitions that include too many statements.
-    "PLR0912",  # Checks for functions or methods with too many branches, including (nested) if, 
+    "PLR0912",  # Checks for functions or methods with too many branches, including (nested) if,
     # elif, and else branches, for loops, try-except clauses, and match and case statements.
     "PLR0915",  # Checks for functions or methods with too many statements.
     "G004",  # f string in logging statements
