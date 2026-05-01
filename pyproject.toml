@@ -13,7 +13,7 @@ version = "1.0.0"
 authors = [{ name = "Jonathan Dekhtiar", email = "jonathan@dekhtiar.com" }]
 readme = "README.md"
 dependencies = [
-    "python-dotenv>=1.2.0,<1.3.0",
+    "python-dotenv>=1.2.2,<1.3.0",
     "python-gitlab>=8.0.0,<9.0.0",
     "GitPython>=3.1.46,<3.2",
     "requests>=2.32,<2.33"
