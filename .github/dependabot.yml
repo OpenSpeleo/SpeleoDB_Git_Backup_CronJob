@@ -20,3 +20,4 @@ updates:
     # Every weekday
     schedule:
       interval: "monthly"
+    versioning-strategy: "increase"
