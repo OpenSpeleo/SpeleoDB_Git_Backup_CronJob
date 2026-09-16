@@ -50,8 +50,8 @@ Both retry helpers currently use exponential backoff:
 
 ### Project detail fetch retry
 
-`_get_full_project_with_retry()` retries transient GitLab/API errors and skips the
-project after retries are exhausted.
+`_get_full_project_with_retry()` retries transient GitLab/API errors and skips
+the project after retries are exhausted.
 
 ### Clone retry
 

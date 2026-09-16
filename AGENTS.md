@@ -40,7 +40,8 @@ GitLab group (including subgroups) into a GOGS instance.
 - Use Python 3.14-compatible code and explicit type hints for new helpers.
 - Keep functions focused and composable; prefer helper methods over deeply
   nested logic.
-- Never log secrets (tokens/passwords); treat URLs with credentials as sensitive.
+- Never log secrets (tokens/passwords); treat URLs with credentials as
+  sensitive.
 - For external I/O (GitLab API, GOGS API, git clone/push), prefer resilient
   error handling with retry + backoff for transient failures.
 - Use structured logging levels:

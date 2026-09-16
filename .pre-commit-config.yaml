@@ -1,21 +1,18 @@
-exclude: "^docs/|/migrations/|devcontainer.json|.*.html|.*.css|.*.js|.*.svg|.*.dist"
-
 default_language_version:
   python: python3.14
 
-# ========================================================================= #
-#                                 FORMATING                                 #
-# ========================================================================= #
-
 repos:
+
+  # ========================================================================= #
+  #                                 FORMATING                                 #
+  # ========================================================================= #
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^tests/artifacts/
       - id: end-of-file-fixer
-        exclude: ^tests/artifacts/
       - id: check-json
+        exclude: ^.devcontainer/devcontainer.json
       - id: check-toml
       - id: check-xml
       - id: check-yaml
@@ -27,7 +24,7 @@ repos:
 
   # Run the Ruff linter.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.2
+    rev: v0.16.7
     hooks:
       # Linter
       - id: ruff
@@ -38,7 +35,7 @@ repos:
         exclude: ^tests/artifacts/
 
   - repo: https://github.com/PyCQA/autoflake
-    rev: v2.3.3 # check for the latest version
+    rev: v2.4.0 # check for the latest version
     hooks:
       - id: autoflake
         args:
@@ -50,13 +47,22 @@ repos:
           ]
         additional_dependencies: ["autoflake"]
 
+  - repo: https://github.com/rbubley/mirrors-prettier
+    rev: v3.9.6
+    hooks:
+      - id: prettier
+        name: prettier markdown
+        types_or: [markdown]
+        args: [--prose-wrap=always]
+        # args: [--prose-wrap=always, --embedded-language-formatting=off]
+
   # ========================================================================= #
   #                           DEPENDENCY MANAGEMENT                           #
   # ========================================================================= #
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
-    rev: 0.10.5
+    rev: 0.12.15
     hooks:
       - id: uv-lock
         args: ["--check"]
@@ -66,22 +72,21 @@ repos:
   # ========================================================================= #
 
   - repo: https://github.com/pycqa/bandit
-    rev: 1.9.3
+    rev: 1.9.4
     hooks:
       - id: bandit
         args: ["-iii", "-ll"]
 
   - repo: https://github.com/pysentry/pysentry-pre-commit
-    rev: v0.4.2
+    rev: v0.5.0
     hooks:
       - id: pysentry
         args:
           [
             "--format=human",
-            "--all-extras",
             "--fail-on=medium",
+            "--forbid-quarantined",
             "--sources=pypa,osv,pypi",
-            "--ignore=GHSA-4xh5-x5gv-qwph"
           ]
 
 # sets up .pre-commit-ci.yaml to ensure pre-commit dependencies stay up to date
