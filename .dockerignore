@@ -211,3 +211,6 @@ __marimo__/
 .ruff_cache
 .pycache
 .uv
+
+# Railway IaC is evaluated locally, not by the Python application image.
+.railway/

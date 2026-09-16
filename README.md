@@ -39,8 +39,18 @@ clones, and pushes retry transient failures at most five times after the initial
 attempt, waiting 1, 2, 4, 8, and 16 seconds. The script creates fresh mirror
 clones and does not perform `git pull`.
 
-`railway.toml` currently leaves `cronSchedule` commented out. Configure a
-schedule in Railway or enable that setting if periodic execution is intended.
+## Railway configuration
+
+[`.railway/railway.ts`](.railway/railway.ts) manages the backup service using
+Railway Infrastructure as Code, including its Dockerfile build and 15-minute
+cron schedule. Existing variable values stay in Railway through `preserve()`.
+
+Install the configuration SDK with `npm ci --prefix .railway`, link this
+directory to the production backup service, and run `railway config plan`. Apply
+reviewed changes with `railway config apply`; deploying application code alone
+does not apply IaC changes. See
+[the Railway configuration guide](.railway/README.md) for the complete workflow
+and official documentation.
 
 ## Validation
 

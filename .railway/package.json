@@ -1,0 +1,11 @@
+{
+  "name": "speleodb-backup-railway-config",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "railway": "3.11.0"
+  }
+}

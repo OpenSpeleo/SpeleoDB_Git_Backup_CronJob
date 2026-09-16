@@ -55,6 +55,11 @@ repos:
         types_or: [markdown]
         args: [--prose-wrap=always]
         # args: [--prose-wrap=always, --embedded-language-formatting=off]
+      - id: prettier
+        name: prettier railway configuration
+        files: ^\.railway/
+        types_or: [ts, json]
+        exclude: ^\.railway/node_modules/
 
   # ========================================================================= #
   #                           DEPENDENCY MANAGEMENT                           #
