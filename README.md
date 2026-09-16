@@ -34,7 +34,10 @@ the updated script; the internal GOGS URL can keep its `http://` scheme.
 
 An authentication rejection with the updated script requires checking the GOGS
 username, access token, and repository permissions. Authentication failures are
-not retried; transient clone and push failures use exponential backoff.
+not retried. All GitLab API calls (including authentication and pagination),
+clones, and pushes retry transient failures at most five times after the initial
+attempt, waiting 1, 2, 4, 8, and 16 seconds. The script creates fresh mirror
+clones and does not perform `git pull`.
 
 `railway.toml` currently leaves `cronSchedule` commented out. Configure a
 schedule in Railway or enable that setting if periodic execution is intended.

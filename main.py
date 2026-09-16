@@ -28,6 +28,7 @@ from git import Remote
 from git import Repo
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
 # Configure logging
@@ -37,6 +38,81 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+MAX_RETRIES = 5
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def _retry_operation[T](
+    operation: Callable[[], T],
+    description: str,
+    is_retryable: Callable[[Exception], bool],
+    retries: int = MAX_RETRIES,
+) -> T:
+    """Run once and retry transient failures at most five times."""
+    if not 0 <= retries <= MAX_RETRIES:
+        raise ValueError(f"retries must be between 0 and {MAX_RETRIES}")
+    for attempt in range(retries + 1):
+        try:
+            return operation()
+        except (
+            GitCommandError,
+            gitlab.GitlabError,
+            requests.exceptions.RequestException,
+        ) as error:
+            if not is_retryable(error) or attempt == retries:
+                # The caller logs the terminal exception once with its context.
+                raise
+            delay_seconds = 2**attempt
+            logger.warning(
+                "%s failed transiently (attempt %s/%s). Retrying in %s seconds...",
+                description,
+                attempt + 1,
+                retries + 1,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+    raise RuntimeError("Unexpected retry state")
+
+
+def _is_retryable_gitlab_error(error: Exception) -> bool:
+    """Retry temporary HTTP/transport failures, never auth or invalid requests."""
+    if isinstance(error, gitlab.GitlabError):
+        return error.response_code in TRANSIENT_HTTP_STATUSES or isinstance(
+            error, gitlab.GitlabConnectionError
+        )
+    if isinstance(error, requests.exceptions.HTTPError):
+        return (
+            error.response is not None
+            and error.response.status_code in TRANSIENT_HTTP_STATUSES
+        )
+    if isinstance(error, requests.exceptions.SSLError):
+        return False
+    return isinstance(
+        error,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    )
+
+
+class RetryingGitlab(gitlab.Gitlab):
+    """Apply one bounded backoff policy to every GitLab request, including pages."""
+
+    def http_request(self, verb: str, path: str, **kwargs: Any) -> requests.Response:
+        # Disable SDK retries so they cannot multiply our retry budget.
+        kwargs.update(
+            obey_rate_limit=False, retry_transient_errors=False, max_retries=0
+        )
+        request = super().http_request
+        return _retry_operation(
+            lambda: request(verb, path, **kwargs),
+            f"GitLab {verb.upper()} request",
+            _is_retryable_gitlab_error,
+        )
 
 
 class GitLabToGOGSBackup:
@@ -70,7 +146,9 @@ class GitLabToGOGSBackup:
         )
 
         # Initialize GitLab client
-        self.gl = gitlab.Gitlab(self.gitlab_url, private_token=self.gitlab_token)
+        self.gl = RetryingGitlab(
+            self.gitlab_url, private_token=self.gitlab_token, timeout=30
+        )
         self.gl.auth()
 
         # GOGS API headers
@@ -83,67 +161,24 @@ class GitLabToGOGSBackup:
         if self.gogs_org:
             self._verify_gogs_org_exists()
 
-    def _is_retryable_gitlab_error(self, error: Exception) -> bool:
-        """Determine whether a GitLab/API error should be retried."""
-        if isinstance(error, requests.exceptions.RequestException):
-            return True
-
-        if isinstance(error, gitlab.GitlabError):
-            response_code = getattr(error, "response_code", None)
-            # Retry common transient status codes.
-            if response_code in {408, 429, 500, 502, 503, 504}:
-                return True
-
-            error_name = type(error).__name__.lower()
-            if "connection" in error_name or "timeout" in error_name:
-                return True
-
-        return False
-
     def _get_full_project_with_retry(
-        self, project_id: int, project_display_name: str, retries: int = 5
+        self, project_id: int, project_display_name: str
     ) -> Any | None:
-        """Fetch full project details with exponential backoff."""
-        total_attempts = retries + 1
-        base_delay_seconds = 1
+        """Fetch project details; the GitLab client owns the request retry budget."""
+        try:
+            return self.gl.projects.get(project_id)
+        except gitlab.GitlabError, requests.exceptions.RequestException:
+            logger.exception(
+                "Failed to load project details for '%s' (id=%s). Skipping project.",
+                project_display_name,
+                project_id,
+            )
+            return None
 
-        for attempt in range(1, total_attempts + 1):
-            try:
-                return self.gl.projects.get(project_id)
-            except (gitlab.GitlabError, requests.exceptions.RequestException) as e:
-                retryable = self._is_retryable_gitlab_error(e)
-                has_attempts_left = attempt < total_attempts
-
-                if not retryable:
-                    logger.exception(
-                        f"Non-retryable error while loading project details for "
-                        f"'{project_display_name}' (id={project_id}). Skipping project."
-                    )
-                    return None
-
-                if has_attempts_left:
-                    delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning(
-                        f"Transient error while loading project details for "
-                        f"'{project_display_name}' (id={project_id}) "
-                        f"(attempt {attempt}/{total_attempts}). Retrying in "
-                        f"{delay_seconds} seconds..."
-                    )
-                    logger.debug("Retryable exception details", exc_info=True)
-                    time.sleep(delay_seconds)
-                    continue
-
-                logger.exception(
-                    f"Exhausted retries while loading project details for "
-                    f"'{project_display_name}' (id={project_id}) after "
-                    f"{total_attempts} attempts. Skipping project."
-                )
-                return None
-
-        return None
-
-    def _is_retryable_git_error(self, error: GitCommandError) -> bool:
+    def _is_retryable_git_error(self, error: Exception) -> bool:
         """Determine whether a Git transport error appears transient."""
+        if not isinstance(error, GitCommandError):
+            return False
         error_blob = " ".join(
             str(part)
             for part in (
@@ -246,61 +281,26 @@ class GitLabToGOGSBackup:
             }
 
     def _clone_repository_with_retry(
-        self, project: Any, destination_dir: str, retries: int = 5
+        self, project: Any, destination_dir: str, retries: int = MAX_RETRIES
     ) -> Repo:
         """Clone a GitLab repository with exponential backoff on transient failures."""
-        total_attempts = retries + 1
-        base_delay_seconds = 1
-        clone_path = os.path.join(destination_dir, "mirror-repo.git")  # noqa: PTH118
+        clone_path = Path(destination_dir) / "mirror-repo.git"
         gitlab_url = self._validate_http_url(
             project.http_url_to_repo, "GitLab repository URL"
         )
 
-        for attempt in range(1, total_attempts + 1):
-            # Ensure retries always start from a clean clone path.
+        def clone() -> Repo:
+            # A failed clone may leave a partial repository behind.
             shutil.rmtree(clone_path, ignore_errors=True)
+            with self._git_credentials("oauth2", self.gitlab_token) as env:
+                repo = Repo.clone_from(gitlab_url, clone_path, mirror=True, env=env)
+                # GitPython retains clone environment values on the new Repo.
+                repo.git.update_environment(**dict.fromkeys(env))
+                return repo
 
-            try:
-                with self._git_credentials("oauth2", self.gitlab_token) as env:
-                    repo = Repo.clone_from(
-                        gitlab_url,
-                        clone_path,
-                        mirror=True,
-                        env=env,
-                    )
-                    # GitPython retains clone environment values on the new Repo.
-                    repo.git.update_environment(**dict.fromkeys(env))
-                    return repo
-            except GitCommandError as e:
-                retryable = self._is_retryable_git_error(e)
-                has_attempts_left = attempt < total_attempts
-
-                if not retryable:
-                    logger.exception(
-                        f"Non-retryable git clone error for {project.name}. "
-                        "Skipping retries."
-                    )
-                    raise
-
-                if has_attempts_left:
-                    delay_seconds = base_delay_seconds * (2 ** (attempt - 1))
-                    logger.warning(
-                        f"Transient git clone error for {project.name} "
-                        f"(attempt {attempt}/{total_attempts}). Retrying in "
-                        f"{delay_seconds} seconds..."
-                    )
-                    logger.debug("Retryable clone exception details", exc_info=True)
-                    time.sleep(delay_seconds)
-                    continue
-
-                logger.exception(
-                    f"Exhausted retries while cloning {project.name} after "
-                    f"{total_attempts} attempts."
-                )
-                raise
-
-        msg = f"Unexpected clone retry state reached for {project.name}"
-        raise RuntimeError(msg)
+        return _retry_operation(
+            clone, f"Git clone of {project.name}", self._is_retryable_git_error, retries
+        )
 
     def _validate_config(self):
         """Validate that all required environment variables are set."""
@@ -423,35 +423,19 @@ class GitLabToGOGSBackup:
         )
 
     def _push_repository_with_retry(
-        self, origin: Remote, repo_name: str, retries: int = 5
+        self, origin: Remote, repo_name: str, retries: int = MAX_RETRIES
     ) -> None:
         """Push all refs, retrying transient failures but not rejected credentials."""
-        total_attempts = retries + 1
         with (
             self._git_credentials(self.gogs_username, self.gogs_token) as env,
             origin.repo.git.custom_environment(**env),
         ):
-            for attempt in range(1, total_attempts + 1):
-                try:
-                    origin.push(mirror=True).raise_if_error()
-                except GitCommandError as error:
-                    if (
-                        not self._is_retryable_git_error(error)
-                        or attempt == total_attempts
-                    ):
-                        raise
-                    delay_seconds = 2 ** (attempt - 1)
-                    logger.warning(
-                        "Transient git push error for %s (attempt %s/%s). "
-                        "Retrying in %s seconds...",
-                        repo_name,
-                        attempt,
-                        total_attempts,
-                        delay_seconds,
-                    )
-                    time.sleep(delay_seconds)
-                else:
-                    return
+            _retry_operation(
+                lambda: origin.push(mirror=True).raise_if_error(),
+                f"Git push of {repo_name}",
+                self._is_retryable_git_error,
+                retries,
+            )
 
     def _backup_repository(self, project: Any):
         """Backup a single repository from GitLab to GOGS."""
@@ -464,7 +448,6 @@ class GitLabToGOGSBackup:
                 repo = self._clone_repository_with_retry(
                     project,
                     temp_dir,
-                    retries=5,
                 )
 
                 # Check if repo exists in GOGS, create if not
@@ -523,7 +506,6 @@ class GitLabToGOGSBackup:
                 full_project = self._get_full_project_with_retry(
                     project.id,
                     project_display_name,
-                    retries=5,
                 )
                 if full_project is None:
                     failed.append(

@@ -17,8 +17,10 @@ Responsibilities are split into helper methods:
   - `_check_gogs_repo_exists()`
   - `_create_gogs_repo()`
   - `_get_gogs_clone_url()`
-- Reliability helpers:
+- Reliability helpers (module-level policy and orchestrator methods):
+  - `_retry_operation()`
   - `_is_retryable_gitlab_error()`
+  - `RetryingGitlab.http_request()`
   - `_get_full_project_with_retry()`
   - `_is_retryable_git_error()`
   - `_clone_repository_with_retry()`
@@ -30,8 +32,9 @@ Responsibilities are split into helper methods:
 ## Runtime flow
 
 1. Initialize and validate environment configuration.
-2. Authenticate against GitLab.
-3. Resolve GitLab group and list eligible projects.
+2. Authenticate against GitLab, with retry for transient API errors.
+3. Resolve GitLab group and list eligible projects, retrying each API request
+   independently, including pagination requests.
 4. For each project:
    - Fetch full project details (with retry for transient API errors).
    - Clone repository from GitLab (with retry for transient clone errors).
@@ -43,19 +46,36 @@ Responsibilities are split into helper methods:
 
 ## Retry model
 
-Project-detail, clone, and push retry helpers use exponential backoff:
+All GitLab API requests and Git clone/push operations share
+`_retry_operation()`:
 
 - Base delay: 1 second.
-- Growth: `1, 2, 4, 8, 16, ...` seconds.
-- Configuration in current code path: `retries=5`, meaning:
+- Delays: `1, 2, 4, 8, 16` seconds.
+- Hard limit: `MAX_RETRIES=5`, meaning:
   - 1 initial attempt
   - up to 5 retries
   - up to 6 total attempts
+- No delay after the final failure; successful operations return immediately.
+- Authentication, permission, invalid-request, and repository rejection errors
+  are not retried.
+- The backup always creates a fresh mirror clone; it has no `git pull` step.
 
-### Project detail fetch retry
+### GitLab API retry
 
-`_get_full_project_with_retry()` retries transient GitLab/API errors and skips
-the project after retries are exhausted.
+`RetryingGitlab.http_request()` covers authentication, group lookup, project
+listing, every pagination request, and project detail lookup. It disables the
+SDK's own retries to prevent nested retry loops from exceeding the limit. A
+failed pagination request retries that page without replaying earlier pages.
+Requests have a 30-second timeout.
+
+Retryable failures include connection errors, timeouts, interrupted responses,
+and HTTP 408, 429, 500, 502, 503, 504, and 520–524. HTTP authentication and
+permission errors, malformed requests, and TLS certificate failures are
+terminal.
+
+`_get_full_project_with_retry()` handles a final request failure by skipping
+that project; it does not add another retry loop. Failures during authentication
+or group discovery end the run with a nonzero exit status.
 
 ### Clone retry
 

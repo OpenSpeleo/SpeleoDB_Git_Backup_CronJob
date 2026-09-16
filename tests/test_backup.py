@@ -81,12 +81,12 @@ class BackupTests(unittest.TestCase):
                     },
                     clear=True,
                 ),
-                patch("main.gitlab.Gitlab") as client,
+                patch("main.RetryingGitlab") as client,
             ):
                 backup = GitLabToGOGSBackup()
                 self.assertEqual(backup.gitlab_url, expected)
                 client.assert_called_once_with(
-                    expected, private_token="source-test-token"
+                    expected, private_token="source-test-token", timeout=30
                 )
 
     def test_rejects_invalid_urls_without_echoing_secrets(self) -> None:
@@ -145,6 +145,34 @@ class BackupTests(unittest.TestCase):
         with patch("main.time.sleep"), self.assertRaises(GitCommandError):
             make_backup()._push_repository_with_retry(origin, "survey", retries=2)
         self.assertEqual(origin.push.call_count, 3)
+
+    def test_clone_and_push_stop_after_five_retries(self) -> None:
+        backup = make_backup()
+        project = SimpleNamespace(
+            name="survey", http_url_to_repo="https://gitlab.test/r"
+        )
+        for operation in ("clone", "push"):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as directory,
+                patch("main.Repo.clone_from") as clone,
+                patch("main.time.sleep") as sleep,
+                self.assertRaises(GitCommandError),
+            ):
+                origin = MagicMock()
+                call = clone if operation == "clone" else origin.push
+                call.side_effect = GitCommandError("git", 128, stderr="HTTP 503")
+                try:
+                    if operation == "clone":
+                        backup._clone_repository_with_retry(project, directory)
+                    else:
+                        backup._push_repository_with_retry(origin, "survey")
+                finally:
+                    self.assertEqual(call.call_count, 6)
+                    self.assertEqual(
+                        [call.args[0] for call in sleep.call_args_list],
+                        [1, 2, 4, 8, 16],
+                    )
 
     def test_clone_retry_removes_partial_repository(self) -> None:
         backup = make_backup()
