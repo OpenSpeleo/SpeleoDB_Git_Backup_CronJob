@@ -13,13 +13,22 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
+from urllib.parse import quote
+from urllib.parse import urlsplit
 
 import gitlab
 import requests
 from dotenv import load_dotenv
 from git import GitCommandError
+from git import Remote
 from git import Repo
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # Configure logging
 logging.basicConfig(
@@ -36,7 +45,9 @@ class GitLabToGOGSBackup:
     def __init__(self):
         """Initialize with credentials from environment variables."""
         # GitLab configuration
-        self.gitlab_url = f"https://{os.environ.get('GITLAB_HOST_URL', 'gitlab.com')}"
+        self.gitlab_url = os.environ.get("GITLAB_HOST_URL", "gitlab.com").strip()
+        if "://" not in self.gitlab_url:
+            self.gitlab_url = f"https://{self.gitlab_url}"
         self.gitlab_token = os.environ.get("GITLAB_TOKEN", "")
         self.gitlab_group_id = os.environ.get("GITLAB_GROUP_ID", "")
 
@@ -131,8 +142,8 @@ class GitLabToGOGSBackup:
 
         return None
 
-    def _is_retryable_clone_error(self, error: GitCommandError) -> bool:
-        """Determine whether a Git clone error appears transient."""
+    def _is_retryable_git_error(self, error: GitCommandError) -> bool:
+        """Determine whether a Git transport error appears transient."""
         error_blob = " ".join(
             str(part)
             for part in (
@@ -142,6 +153,20 @@ class GitLabToGOGSBackup:
             )
         ).lower()
 
+        if any(
+            marker in error_blob
+            for marker in (
+                "authentication failed",
+                "could not read username",
+                "access denied",
+                "permission denied",
+                "requested url returned error: 401",
+                "requested url returned error: 403",
+                "hook declined",
+            )
+        ):
+            return False
+
         transient_markers = (
             "rpc failed",
             "http 500",
@@ -149,6 +174,13 @@ class GitLabToGOGSBackup:
             "http 503",
             "http 504",
             "http 429",
+            "requested url returned error: 500",
+            "requested url returned error: 502",
+            "requested url returned error: 503",
+            "requested url returned error: 504",
+            "requested url returned error: 429",
+            "could not resolve host",
+            "failed to connect",
             "remote end closed connection",
             "remote end hung up unexpectedly",
             "expected flush after ref listing",
@@ -160,6 +192,59 @@ class GitLabToGOGSBackup:
         )
         return any(marker in error_blob for marker in transient_markers)
 
+    @staticmethod
+    def _validate_http_url(url: str, setting: str) -> str:
+        """Validate without including potentially sensitive input in errors."""
+        url = url.strip().rstrip("/")
+        try:
+            parsed = urlsplit(url)
+            valid = (
+                parsed.scheme in {"http", "https"}
+                and bool(parsed.hostname)
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and not any(char.isspace() for char in url)
+            )
+            _ = parsed.port  # Validate a supplied port.
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f"{setting} must be an HTTP(S) URL without credentials, "
+                "query parameters, or a fragment"
+            )
+        return url
+
+    @staticmethod
+    @contextmanager
+    def _git_credentials(username: str, token: str) -> Iterator[dict[str, str]]:
+        """Provide credentials to Git without embedding them in URLs or files."""
+        with tempfile.TemporaryDirectory(prefix="backup-askpass-") as directory:
+            script = Path(directory) / "askpass.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                '  Username*) printf "%s\\n" "$BACKUP_GIT_USERNAME" ;;\n'
+                '  Password*) printf "%s\\n" "$BACKUP_GIT_TOKEN" ;;\n'
+                "  *) exit 1 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            yield {
+                "GIT_ASKPASS": str(script),
+                "GIT_TERMINAL_PROMPT": "0",
+                "BACKUP_GIT_USERNAME": username,
+                "BACKUP_GIT_TOKEN": token,
+                "LC_ALL": "C",
+                # Disable credential helpers so they cannot cache the tokens.
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "credential.helper",
+                "GIT_CONFIG_VALUE_0": "",
+            }
+
     def _clone_repository_with_retry(
         self, project: Any, destination_dir: str, retries: int = 5
     ) -> Repo:
@@ -167,8 +252,8 @@ class GitLabToGOGSBackup:
         total_attempts = retries + 1
         base_delay_seconds = 1
         clone_path = os.path.join(destination_dir, "mirror-repo.git")  # noqa: PTH118
-        gitlab_url = project.http_url_to_repo.replace(
-            "https://", f"https://oauth2:{self.gitlab_token}@"
+        gitlab_url = self._validate_http_url(
+            project.http_url_to_repo, "GitLab repository URL"
         )
 
         for attempt in range(1, total_attempts + 1):
@@ -176,13 +261,18 @@ class GitLabToGOGSBackup:
             shutil.rmtree(clone_path, ignore_errors=True)
 
             try:
-                return Repo.clone_from(
-                    gitlab_url,
-                    clone_path,
-                    mirror=True,  # Clone as mirror to get all refs
-                )
+                with self._git_credentials("oauth2", self.gitlab_token) as env:
+                    repo = Repo.clone_from(
+                        gitlab_url,
+                        clone_path,
+                        mirror=True,
+                        env=env,
+                    )
+                    # GitPython retains clone environment values on the new Repo.
+                    repo.git.update_environment(**dict.fromkeys(env))
+                    return repo
             except GitCommandError as e:
-                retryable = self._is_retryable_clone_error(e)
+                retryable = self._is_retryable_git_error(e)
                 has_attempts_left = attempt < total_attempts
 
                 if not retryable:
@@ -228,8 +318,8 @@ class GitLabToGOGSBackup:
                 f"Missing required environment variables: {', '.join(missing_vars)}"
             )
 
-        # Ensure GOGS URL doesn't end with slash
-        self.gogs_url = self.gogs_url.rstrip("/")
+        self.gitlab_url = self._validate_http_url(self.gitlab_url, "GITLAB_HOST_URL")
+        self.gogs_url = self._validate_http_url(self.gogs_url, "GOGS_INSTANCE_URL")
 
     def _verify_gogs_org_exists(self):
         """Verify that the GOGS organization exists and is accessible."""
@@ -326,22 +416,48 @@ class GitLabToGOGSBackup:
             raise
 
     def _get_gogs_clone_url(self, repo_name: str) -> str:
-        """Get the GOGS repository clone URL with authentication."""
-        if self.gogs_org:
-            repo_path = f"{self.gogs_org}/{repo_name}"
-        else:
-            repo_path = f"{self.gogs_username}/{repo_name}"
-
-        # Use HTTPS with token authentication
-        gogs_base = self.gogs_url.replace(
-            "https://", f"https://{self.gogs_username}:{self.gogs_token}@"
+        """Get the GOGS repository URL; authentication is supplied separately."""
+        owner = self.gogs_org or self.gogs_username
+        return (
+            f"{self.gogs_url}/{quote(owner, safe='')}/{quote(repo_name, safe='')}.git"
         )
-        return f"{gogs_base}/{repo_path}.git"
+
+    def _push_repository_with_retry(
+        self, origin: Remote, repo_name: str, retries: int = 5
+    ) -> None:
+        """Push all refs, retrying transient failures but not rejected credentials."""
+        total_attempts = retries + 1
+        with (
+            self._git_credentials(self.gogs_username, self.gogs_token) as env,
+            origin.repo.git.custom_environment(**env),
+        ):
+            for attempt in range(1, total_attempts + 1):
+                try:
+                    origin.push(mirror=True).raise_if_error()
+                except GitCommandError as error:
+                    if (
+                        not self._is_retryable_git_error(error)
+                        or attempt == total_attempts
+                    ):
+                        raise
+                    delay_seconds = 2 ** (attempt - 1)
+                    logger.warning(
+                        "Transient git push error for %s (attempt %s/%s). "
+                        "Retrying in %s seconds...",
+                        repo_name,
+                        attempt,
+                        total_attempts,
+                        delay_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                else:
+                    return
 
     def _backup_repository(self, project: Any):
         """Backup a single repository from GitLab to GOGS."""
         # Create temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
+            repo: Repo | None = None
             try:
                 # Clone from GitLab
                 logger.info(f"Cloning {project.name} from GitLab...")
@@ -366,17 +482,13 @@ class GitLabToGOGSBackup:
 
                 # Push to GOGS (mirror push to sync all refs)
                 logger.info(f"Pushing {project.name} to GOGS...")
-                origin.push(mirror=True)
+                self._push_repository_with_retry(origin, project.name)
 
                 logger.info(f"Successfully backed up {project.name}")
 
-            except GitCommandError:
-                logger.exception(f"Git error while backing up {project.name}")
-                raise
-
-            except Exception:
-                logger.exception(f"Failed to backup {project.name}")
-                raise
+            finally:
+                if repo is not None:
+                    repo.close()
 
     def run(self):
         """Run the backup process for all repositories in the GitLab group."""

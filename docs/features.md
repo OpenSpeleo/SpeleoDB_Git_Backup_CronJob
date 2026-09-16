@@ -8,11 +8,14 @@
 - Clones each repository with `--mirror` semantics.
 - Creates destination repositories in GOGS when missing.
 - Pushes all refs to GOGS with mirror push.
+- Authenticates Git operations over HTTP and HTTPS without credentials in URLs.
 
 ## Reliability features
 
 - Retries transient GitLab project-detail API failures with exponential backoff.
 - Retries transient git clone failures with exponential backoff.
+- Retries transient mirror push failures with exponential backoff.
+- Treats rejected pushes as failures and avoids retrying authentication errors.
 - Skips failed projects and continues processing remaining repositories.
 - Produces a final run summary with successful and failed repositories.
 

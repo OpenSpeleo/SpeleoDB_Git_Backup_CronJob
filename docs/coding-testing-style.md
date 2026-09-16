@@ -36,7 +36,13 @@ Minimum checks for code changes:
 ```bash
 uv run ruff check .
 PYTHONPYCACHEPREFIX=./.pycache python3 -m py_compile main.py
+uv run python -m unittest discover -v
 ```
+
+The regression suite includes a local authenticated HTTP Git server and
+temporary repositories, with a simulated GitLab group and GOGS API. It verifies
+real mirror transfers without touching production. A live test-group check
+remains useful when changing provider-specific API behavior.
 
 Recommended behavior tests:
 
