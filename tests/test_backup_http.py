@@ -36,6 +36,7 @@ class GitHTTPServer(ThreadingHTTPServer):
     destination_token: str
     username: str
     created: int = 0
+    lookup_failures_remaining: int = 1
 
 
 class GitHTTPHandler(BaseHTTPRequestHandler):
@@ -113,6 +114,10 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             self.respond(401)
             return
         if self.command == "GET":
+            if self.server.lookup_failures_remaining:
+                self.server.lookup_failures_remaining -= 1
+                self.respond(503)
+                return
             exists = (self.server.root / "test-org/survey.git").exists()
             self.respond(200 if exists else 404)
             return
@@ -190,6 +195,7 @@ class HTTPBackupTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 1)
             output = "\n".join(logs.output)
             self.assertIn("Successfully backed up survey", output)
+            self.assertIn("Retrying in 1 seconds", output)
             self.assertIn("Failed: 1 repositories", output)
             self.assertNotIn(server.source_token, output)
             self.assertNotIn(server.destination_token, output)

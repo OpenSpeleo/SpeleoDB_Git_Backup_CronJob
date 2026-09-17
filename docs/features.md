@@ -15,12 +15,15 @@
 - Retries transient failures on every GitLab API request, including
   authentication, group lookup, project listing, pagination, and project
   details.
+- Retries transient GOGS API failures, including timeouts during repository
+  checks, creation, and organization verification.
 - Retries transient git clone failures with exponential backoff.
 - Retries transient mirror push failures with exponential backoff.
 - Uses at most five retries per operation, delayed by 1, 2, 4, 8, and 16
   seconds.
 - Treats rejected pushes as failures and avoids retrying authentication errors.
 - Skips failed projects and continues processing remaining repositories.
+- Reports terminal GOGS request failures without tracebacks.
 - Produces a final run summary with successful and failed repositories.
 
 ## Operational behavior

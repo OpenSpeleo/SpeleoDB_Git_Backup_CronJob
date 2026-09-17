@@ -76,12 +76,8 @@ def _retry_operation[T](
     raise RuntimeError("Unexpected retry state")
 
 
-def _is_retryable_gitlab_error(error: Exception) -> bool:
+def _is_retryable_http_error(error: Exception) -> bool:
     """Retry temporary HTTP/transport failures, never auth or invalid requests."""
-    if isinstance(error, gitlab.GitlabError):
-        return error.response_code in TRANSIENT_HTTP_STATUSES or isinstance(
-            error, gitlab.GitlabConnectionError
-        )
     if isinstance(error, requests.exceptions.HTTPError):
         return (
             error.response is not None
@@ -97,6 +93,15 @@ def _is_retryable_gitlab_error(error: Exception) -> bool:
             requests.exceptions.ChunkedEncodingError,
         ),
     )
+
+
+def _is_retryable_gitlab_error(error: Exception) -> bool:
+    """Apply the shared HTTP policy to GitLab SDK errors too."""
+    if isinstance(error, gitlab.GitlabError):
+        return error.response_code in TRANSIENT_HTTP_STATUSES or isinstance(
+            error, gitlab.GitlabConnectionError
+        )
+    return _is_retryable_http_error(error)
 
 
 class RetryingGitlab(gitlab.Gitlab):
@@ -345,13 +350,19 @@ class GitLabToGOGSBackup:
     def _gogs_api_request(
         self, method: str, endpoint: str, data: dict[str, Any] | None = None
     ) -> requests.Response:
-        """Make a request to the GOGS API."""
+        """Make a GOGS API request with bounded retries for transient failures."""
         url = f"{self.gogs_url}/api/v1{endpoint}"
-        response = requests.request(
-            method=method, url=url, headers=self.gogs_headers, json=data, timeout=30
+
+        def request() -> requests.Response:
+            response = requests.request(
+                method=method, url=url, headers=self.gogs_headers, json=data, timeout=30
+            )
+            response.raise_for_status()
+            return response
+
+        return _retry_operation(
+            request, f"GOGS {method.upper()} {endpoint}", _is_retryable_http_error
         )
-        response.raise_for_status()
-        return response
 
     def _check_gogs_repo_exists(self, repo_name: str) -> bool:
         """Check if a repository exists in GOGS."""
@@ -368,7 +379,6 @@ class GitLabToGOGSBackup:
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
                 return False
-            logger.exception("GOGS API request failed")
             raise
 
     def _create_gogs_repo(self, project: Any) -> dict[str, Any]:
@@ -405,14 +415,13 @@ class GitLabToGOGSBackup:
                 return {"name": project.name}  # Return minimal info
 
             if e.response.status_code == 404 and self.gogs_org:
-                logger.exception(
+                logger.error(  # noqa: TRY400 - expected API failure, no traceback
                     f"Organization '{self.gogs_org}' not found or you don't have "
                     "permission to create repos in it. Please verify: 1) Organization "
                     "exists in GOGS, 2) Your token has org repo creation permissions"
                 )
                 raise
 
-            logger.exception("GOGS API request failed")
             raise
 
     def _get_gogs_clone_url(self, repo_name: str) -> str:
@@ -524,6 +533,17 @@ class GitLabToGOGSBackup:
                 try:
                     self._backup_repository(full_project)
                     successful.append(full_project.name)
+                except requests.exceptions.RequestException as error:
+                    # Avoid dumping request details or credentials into the logs.
+                    reason = f"GOGS API request failed: {type(error).__name__}"
+                    if error.response is not None:
+                        reason += f" (HTTP {error.response.status_code})"
+                    logger.error(  # noqa: TRY400 - skip expected request failures
+                        "Failed to backup %s: %s. Skipping project.",
+                        full_project.name,
+                        reason,
+                    )
+                    failed.append((full_project.name, reason))
                 except Exception as e:
                     logger.exception(f"Failed to backup {full_project.name}")
                     failed.append((full_project.name, str(e)))

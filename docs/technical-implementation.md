@@ -19,6 +19,7 @@ Responsibilities are split into helper methods:
   - `_get_gogs_clone_url()`
 - Reliability helpers (module-level policy and orchestrator methods):
   - `_retry_operation()`
+  - `_is_retryable_http_error()`
   - `_is_retryable_gitlab_error()`
   - `RetryingGitlab.http_request()`
   - `_get_full_project_with_retry()`
@@ -46,7 +47,7 @@ Responsibilities are split into helper methods:
 
 ## Retry model
 
-All GitLab API requests and Git clone/push operations share
+All GitLab and GOGS API requests and Git clone/push operations share
 `_retry_operation()`:
 
 - Base delay: 1 second.
@@ -76,6 +77,19 @@ terminal.
 `_get_full_project_with_retry()` handles a final request failure by skipping
 that project; it does not add another retry loop. Failures during authentication
 or group discovery end the run with a nonzero exit status.
+
+### GOGS API retry
+
+`_gogs_api_request()` applies the shared HTTP retry policy to organization
+verification, repository existence checks, and repository creation. Each attempt
+has a 30-second timeout. Missing repositories (404) and creation conflicts (409)
+are handled by their callers without retrying those responses; a conflict after
+a timed-out creation is treated as an already-existing repository.
+
+An exhausted or permanent GOGS request failure during backup is logged as a
+concise error without a traceback. The repository is included in the failure
+summary, its temporary clone is cleaned up, and the next project is processed.
+The run still exits nonzero if any repository failed.
 
 ### Clone retry
 
@@ -108,5 +122,6 @@ before use.
 ## Error handling strategy
 
 - Retryable/transient failures are logged as `WARNING` with attempt information.
-- Final unrecoverable failures are logged with stack traces.
+- Terminal GOGS request failures during backup are logged without stack traces;
+  unexpected exceptions retain tracebacks for debugging.
 - A failure for one project does not terminate processing of other projects.
