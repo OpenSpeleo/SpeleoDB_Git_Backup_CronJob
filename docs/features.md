@@ -19,11 +19,13 @@
   checks, creation, and organization verification.
 - Retries transient git clone failures with exponential backoff.
 - Retries transient mirror push failures with exponential backoff.
-- Uses at most five retries per operation, delayed by 1, 2, 4, 8, and 16
+- Uses at most five retries per operation, delayed by 2, 4, 8, 16, and 30
   seconds.
 - Treats rejected pushes as failures and avoids retrying authentication errors.
 - Skips failed projects and continues processing remaining repositories.
 - Reports terminal GOGS request failures without tracebacks.
+- Reports terminal GitLab API failures with the error type and HTTP status,
+  without dumping response bodies or tracebacks.
 - Produces a final run summary with successful and failed repositories.
 
 ## Operational behavior

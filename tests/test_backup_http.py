@@ -195,7 +195,7 @@ class HTTPBackupTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 1)
             output = "\n".join(logs.output)
             self.assertIn("Successfully backed up survey", output)
-            self.assertIn("Retrying in 1 seconds", output)
+            self.assertIn("Retrying in 2 seconds", output)
             self.assertIn("Failed: 1 repositories", output)
             self.assertNotIn(server.source_token, output)
             self.assertNotIn(server.destination_token, output)

@@ -50,8 +50,9 @@ Responsibilities are split into helper methods:
 All GitLab and GOGS API requests and Git clone/push operations share
 `_retry_operation()`:
 
-- Base delay: 1 second.
-- Delays: `1, 2, 4, 8, 16` seconds.
+- Base delay: 2 seconds; maximum delay: 30 seconds.
+- Delays: `2, 4, 8, 16, 30` seconds (60 seconds of waiting in total, plus the
+  time spent making requests).
 - Hard limit: `MAX_RETRIES=5`, meaning:
   - 1 initial attempt
   - up to 5 retries
@@ -76,7 +77,10 @@ terminal.
 
 `_get_full_project_with_retry()` handles a final request failure by skipping
 that project; it does not add another retry loop. Failures during authentication
-or group discovery end the run with a nonzero exit status.
+or group discovery end the run with a nonzero exit status. Expected API failures
+are logged with the exception type and HTTP status when available, without
+response bodies or tracebacks. Retry warnings also include this safe error
+summary, so a repeated 503 is visible before retries run out.
 
 ### GOGS API retry
 

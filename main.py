@@ -41,7 +41,23 @@ logger = logging.getLogger(__name__)
 
 
 MAX_RETRIES = 5
+RETRY_BASE_DELAY_SECONDS = 2
+RETRY_MAX_DELAY_SECONDS = 30
 TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def _request_error_summary(error: Exception) -> str:
+    """Describe failures without logging response bodies or credentialed URLs."""
+    status = None
+    if isinstance(error, gitlab.GitlabError):
+        status = error.response_code
+    elif isinstance(error, requests.exceptions.RequestException):
+        if error.response is not None:
+            status = error.response.status_code
+    summary = type(error).__name__
+    if status is not None:
+        summary += f" (HTTP {status})"
+    return summary
 
 
 def _retry_operation[T](
@@ -64,10 +80,13 @@ def _retry_operation[T](
             if not is_retryable(error) or attempt == retries:
                 # The caller logs the terminal exception once with its context.
                 raise
-            delay_seconds = 2**attempt
+            delay_seconds = min(
+                RETRY_BASE_DELAY_SECONDS * 2**attempt, RETRY_MAX_DELAY_SECONDS
+            )
             logger.warning(
-                "%s failed transiently (attempt %s/%s). Retrying in %s seconds...",
+                "%s failed transiently: %s (attempt %s/%s). Retrying in %s seconds...",
                 description,
+                _request_error_summary(error),
                 attempt + 1,
                 retries + 1,
                 delay_seconds,
@@ -172,11 +191,13 @@ class GitLabToGOGSBackup:
         """Fetch project details; the GitLab client owns the request retry budget."""
         try:
             return self.gl.projects.get(project_id)
-        except gitlab.GitlabError, requests.exceptions.RequestException:
-            logger.exception(
-                "Failed to load project details for '%s' (id=%s). Skipping project.",
+        except (gitlab.GitlabError, requests.exceptions.RequestException) as error:
+            logger.error(  # noqa: TRY400 - expected API failure, no response body
+                "Failed to load project details for '%s' (id=%s): %s. "
+                "Skipping project.",
                 project_display_name,
                 project_id,
+                _request_error_summary(error),
             )
             return None
 
@@ -561,8 +582,10 @@ class GitLabToGOGSBackup:
                 # Exit with error code if any backups failed
                 sys.exit(1)
 
-        except gitlab.GitlabError:
-            logger.exception("GitLab API error")
+        except (gitlab.GitlabError, requests.exceptions.RequestException) as error:
+            logger.error(  # noqa: TRY400 - expected API failure, no response body
+                "GitLab API request failed: %s", _request_error_summary(error)
+            )
             sys.exit(1)
 
         except Exception:
@@ -578,6 +601,12 @@ def main():
         backup = GitLabToGOGSBackup()
         backup.run()
         logger.info("Backup process completed successfully!")
+
+    except (gitlab.GitlabError, requests.exceptions.RequestException) as error:
+        logger.error(  # noqa: TRY400 - expected API failure, no response body
+            "Backup process failed: %s", _request_error_summary(error)
+        )
+        sys.exit(1)
 
     except Exception:
         logger.exception("Backup process failed")

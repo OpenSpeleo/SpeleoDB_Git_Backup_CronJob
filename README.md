@@ -36,7 +36,7 @@ An authentication rejection with the updated script requires checking the GOGS
 username, access token, and repository permissions. Authentication failures are
 not retried. All GitLab API calls (including authentication and pagination),
 clones, and pushes retry transient failures at most five times after the initial
-attempt, waiting 1, 2, 4, 8, and 16 seconds. The script creates fresh mirror
+attempt, waiting 2, 4, 8, 16, and 30 seconds. The script creates fresh mirror
 clones and does not perform `git pull`.
 
 ## Railway configuration

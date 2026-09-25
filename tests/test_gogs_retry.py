@@ -38,7 +38,7 @@ class GOGSRetryTests(unittest.TestCase):
                 self.assertTrue(make_backup()._check_gogs_repo_exists("survey"))
                 self.assertEqual(request.call_count, 6)
                 self.assertEqual(
-                    [call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8, 16]
+                    [call.args[0] for call in sleep.call_args_list], [2, 4, 8, 16, 30]
                 )
                 self.assertEqual(request.call_args.kwargs["timeout"], 30)
 
@@ -98,7 +98,7 @@ class GOGSRetryTests(unittest.TestCase):
                 self.assertEqual(backup._create_gogs_repo(project), {"name": "survey"})
                 self.assertEqual(request.call_count, 2)
                 self.assertEqual(request.call_args.kwargs["method"], "POST")
-                sleep.assert_called_once_with(1)
+                sleep.assert_called_once_with(2)
 
     def test_org_verification_retries(self) -> None:
         with (
@@ -110,7 +110,7 @@ class GOGSRetryTests(unittest.TestCase):
         ):
             make_backup()._verify_gogs_org_exists()
         self.assertEqual(request.call_count, 2)
-        sleep.assert_called_once_with(1)
+        sleep.assert_called_once_with(2)
 
     def test_exhaustion_skips_project_without_traceback_and_cleans_up(self) -> None:
         backup = make_backup()
@@ -142,7 +142,7 @@ class GOGSRetryTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 1)
             self.assertEqual(request.call_count, 7)
             self.assertEqual(
-                [call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8, 16]
+                [call.args[0] for call in sleep.call_args_list], [2, 4, 8, 16, 30]
             )
             push.assert_called_once_with(repos[1].create_remote.return_value, "survey1")
             for repo in repos:

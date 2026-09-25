@@ -121,7 +121,7 @@ class BackupTests(unittest.TestCase):
         with patch("main.time.sleep") as sleep:
             backup._push_repository_with_retry(origin, "survey", retries=2)
         self.assertEqual(origin.push.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2, 4])
 
     def test_push_rejection_and_auth_failure_are_terminal(self) -> None:
         backup = make_backup()
@@ -171,7 +171,7 @@ class BackupTests(unittest.TestCase):
                     self.assertEqual(call.call_count, 6)
                     self.assertEqual(
                         [call.args[0] for call in sleep.call_args_list],
-                        [1, 2, 4, 8, 16],
+                        [2, 4, 8, 16, 30],
                     )
 
     def test_clone_retry_removes_partial_repository(self) -> None:
