@@ -4,6 +4,7 @@ package = false
 [dependency-groups]
 dev = [
   "prek>=0.5.2,<0.6",
+  "pytest>=9.1.1",
   "ruff>=0.16.7,<0.17",
 ]
 
