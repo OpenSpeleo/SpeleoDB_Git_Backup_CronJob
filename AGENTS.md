@@ -20,6 +20,24 @@ GitLab group (including subgroups) into a GOGS instance.
 - Retries transient GitLab project-detail API failures with exponential backoff.
 - Retries transient Git clone failures with exponential backoff.
 
+## Temporary agent files
+
+Keep agent plans, task lists, TODO tracking, progress notes, review notes, and
+scratch lessons outside the repository tree, including all submodules. Use a
+unique task directory under `/tmp/` (for example, create one with
+`mktemp -d /tmp/sdb-git-backup-cronjob-task.XXXXXX`) or another OS temporary
+directory whose resolved path is outside every checkout.
+
+Never create or update these working files inside the checkout, even in ignored
+directories such as `tasks/`, `todos/`, `.cursor`, or `plans/`. Never stage or
+commit them.
+
+Existing tracked task and lesson files are historical references; do not append
+new work to them. Keep durable product and architecture documentation in
+`docs/`, without embedding task checklists or linking to temporary files. Before
+an authorized commit, inspect the staged filenames and exclude all agent working
+files.
+
 ## Technical implementation snapshot
 
 - Main entrypoint: `main.py`.
@@ -37,13 +55,19 @@ GitLab group (including subgroups) into a GOGS instance.
 
 ## Coding rules
 
-- Use Python 3.14-compatible code and explicit type hints for new helpers.
+- Use Python 3.14-compatible code and maintain compatibility with existing
+  project dependencies.
+- Use explicit type hints for new helpers and non-trivial functions and methods.
 - Keep functions focused and composable; prefer helper methods over deeply
   nested logic.
 - Never log secrets (tokens/passwords); treat URLs with credentials as
   sensitive.
-- For external I/O (GitLab API, GOGS API, git clone/push), prefer resilient
-  error handling with retry + backoff for transient failures.
+- Treat external I/O (GitLab API, GOGS API, git clone/push) as failure-prone:
+  detect transient failures and retry them with exponential backoff.
+- Log retry attempts with operation context, attempt number, maximum attempt
+  count, and delay before the next attempt. Log the final success or failure.
+- Preserve resilience: one failed project must not abort other project backups.
+- Use Python's `logging` module for progress and failures; do not use `print`.
 - Use structured logging levels:
   - `INFO`: normal progress.
   - `WARNING`: retryable/transient failures.
@@ -52,7 +76,7 @@ GitLab group (including subgroups) into a GOGS instance.
 
 ## Testing and validation rules
 
-Before merging changes, run:
+After code edits and before merging changes, run:
 
 ```bash
 uv run ruff check .
