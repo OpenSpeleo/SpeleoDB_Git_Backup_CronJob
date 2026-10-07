@@ -7,17 +7,19 @@ updates:
   - package-ecosystem: "github-actions"
     open-pull-requests-limit: 25
     directory: "/"
-    # Every weekday
     schedule:
       interval: "monthly"
 
-  # Enable version updates for Python/Pip - Production
+  # Update production and development requirements in pyproject.toml.
   - package-ecosystem: "pip"
     open-pull-requests-limit: 50
-    # Look for a `requirements.txt` in the `root` directory
-    # also 'setup.cfg', 'runtime.txt' and 'requirements/*.txt'
     directory: "/"
-    # Every weekday
     schedule:
       interval: "monthly"
-    versioning-strategy: "increase"
+    # Preserve >= lower bounds; raise < upper bounds only when necessary.
+    # Releases already allowed by the range do not need a manifest update.
+    versioning-strategy: "increase-if-necessary"
+    # No standalone lockfile updates. Refresh the lockfile alongside manifest
+    # changes before merging; keep this job on pip rather than uv.
+    exclude-paths:
+      - "uv.lock"
