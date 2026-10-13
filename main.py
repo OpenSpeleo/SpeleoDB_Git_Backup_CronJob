@@ -7,6 +7,8 @@ It reads credentials from environment variables and uses GitPython for git opera
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import logging
 import os
 import shutil
@@ -150,6 +152,10 @@ class GitLabToGOGSBackup:
             self.gitlab_url = f"https://{self.gitlab_url}"
         self.gitlab_token = os.environ.get("GITLAB_TOKEN", "")
         self.gitlab_group_id = os.environ.get("GITLAB_GROUP_ID", "")
+        backup_dir = os.environ.get("GIT_PROJECT_DIR", "").strip()
+        if not backup_dir:
+            raise ValueError("GIT_PROJECT_DIR is required and must not be empty")
+        self.backup_dir = Path(backup_dir).expanduser().resolve()
 
         # GOGS configuration
         self.gogs_url = os.environ.get("GOGS_INSTANCE_URL", "")
@@ -163,6 +169,7 @@ class GitLabToGOGSBackup:
         # Log configuration (mask sensitive data)
         logger.info(f"GitLab URL: {self.gitlab_url}")
         logger.info(f"GitLab Group ID: {self.gitlab_group_id}")
+        logger.info("Git project directory: %s", self.backup_dir)
         logger.info(f"GOGS URL: {self.gogs_url}")
         logger.info(f"GOGS Username: {self.gogs_username}")
         logger.info(
@@ -328,6 +335,72 @@ class GitLabToGOGSBackup:
             clone, f"Git clone of {project.name}", self._is_retryable_git_error, retries
         )
 
+    def _repository_path(self, project: Any) -> Path:
+        """Keep project renames stable and separate different GitLab instances."""
+        instance = hashlib.sha256(self.gitlab_url.encode()).hexdigest()[:16]
+        return self.backup_dir / instance / f"{int(project.id)}.git"
+
+    @staticmethod
+    @contextmanager
+    def _repository_lock(repo_path: Path) -> Iterator[None]:
+        """Protect the entire fetch/push sequence against overlapping cron runs."""
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        with repo_path.with_suffix(".lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    "Repository is in use by another backup run"
+                ) from None
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _fetch_repository_with_retry(self, repo: Repo, project: Any) -> None:
+        """Replace all local refs with upstream refs, including rewritten tags."""
+        gitlab_url = self._validate_http_url(
+            project.http_url_to_repo, "GitLab repository URL"
+        )
+        repo.remotes.origin.set_url(gitlab_url)
+        with (
+            self._git_credentials("oauth2", self.gitlab_token) as env,
+            repo.git.custom_environment(**env),
+        ):
+            _retry_operation(
+                lambda: repo.git.fetch(
+                    "origin", "+refs/*:refs/*", force=True, prune=True, atomic=True
+                ),
+                f"Git fetch of {project.name}",
+                self._is_retryable_git_error,
+            )
+        logger.info("Successfully fetched %s from GitLab", project.name)
+
+    def _clone_or_fetch_repository(self, project: Any, repo_path: Path) -> Repo:
+        """Publish only complete clones; preserve existing mirrors on failure."""
+        if not repo_path.exists():
+            logger.info("Cloning %s from GitLab...", project.name)
+            with tempfile.TemporaryDirectory(
+                prefix=f"{repo_path.stem}-clone-", dir=repo_path.parent
+            ) as staging_dir:
+                repo = self._clone_repository_with_retry(project, staging_dir)
+                repo.close()
+                (Path(staging_dir) / "mirror-repo.git").rename(repo_path)
+            logger.info("Successfully cloned %s from GitLab", project.name)
+            return Repo(repo_path)
+
+        logger.info("Fetching %s from GitLab...", project.name)
+        repo = Repo(repo_path)
+        if not repo.bare:
+            repo.close()
+            raise ValueError("Persistent backup repository must be bare")
+        try:
+            self._fetch_repository_with_retry(repo, project)
+        except Exception:
+            repo.close()
+            raise
+        return repo
+
     def _validate_config(self):
         """Validate that all required environment variables are set."""
         required_vars = {
@@ -467,35 +540,33 @@ class GitLabToGOGSBackup:
                 retries,
             )
 
-    def _backup_repository(self, project: Any):
+    def _backup_repository(self, project: Any) -> None:
         """Backup a single repository from GitLab to GOGS."""
-        # Create temporary directory
-        with tempfile.TemporaryDirectory() as temp_dir:
+        repo_path = self._repository_path(project)
+        with self._repository_lock(repo_path):
             repo: Repo | None = None
             try:
-                # Clone from GitLab
-                logger.info(f"Cloning {project.name} from GitLab...")
-                repo = self._clone_repository_with_retry(
-                    project,
-                    temp_dir,
-                )
+                repo = self._clone_or_fetch_repository(project, repo_path)
 
                 # Check if repo exists in GOGS, create if not
                 if not self._check_gogs_repo_exists(project.name):
                     logger.info(f"Creating repository {project.name} in GOGS...")
                     self._create_gogs_repo(project)
 
-                # Update remote to GOGS
-                logger.info("Updating remote to GOGS...")
-                if "origin" in [r.name for r in repo.remotes]:
-                    repo.delete_remote(repo.remotes.origin)
-
+                # Keep origin pointing at GitLab for the next incremental fetch.
                 gogs_url = self._get_gogs_clone_url(project.name)
-                origin = repo.create_remote("origin", gogs_url)
+                if "gogs" in repo.remotes:
+                    destination = repo.remotes.gogs
+                    destination.set_url(gogs_url)
+                else:
+                    destination = repo.create_remote("gogs", gogs_url)
+                # GOGS must never create tracking refs inside the source mirror.
+                with destination.config_writer as config:
+                    config.remove_option("fetch")
 
                 # Push to GOGS (mirror push to sync all refs)
                 logger.info(f"Pushing {project.name} to GOGS...")
-                self._push_repository_with_retry(origin, project.name)
+                self._push_repository_with_retry(destination, project.name)
 
                 logger.info(f"Successfully backed up {project.name}")
 

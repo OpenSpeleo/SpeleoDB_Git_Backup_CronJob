@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from git import Repo
@@ -27,7 +28,7 @@ if TYPE_CHECKING:
 
 # The fixture executes the installed git binary against disposable local repositories.
 # Tokens below are synthetic fixtures.
-# ruff: noqa: PT009, PT027, S603, S105
+# ruff: noqa: PT009, PT027, S603, S105, SLF001
 
 
 class GitHTTPServer(ThreadingHTTPServer):
@@ -138,6 +139,7 @@ class HTTPBackupTests(unittest.TestCase):
         backup = make_backup()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            backup.backup_dir = root / "mirrors"
             with Repo.init(root / "source/survey.git", bare=True) as source:
                 commit = source.git.hash_object("-t", "tree", "--stdin", istream=None)
                 # Create a real commit without relying on global Git identity.
@@ -151,6 +153,8 @@ class HTTPBackupTests(unittest.TestCase):
                 source.git.update_ref("refs/heads/main", commit)
                 source.git.update_ref("refs/heads/feature", commit)
                 source.git.update_ref("refs/tags/v1", commit)
+                source.git.update_ref("refs/tags/delete-me", commit)
+                source.git.update_ref("refs/notes/test", commit)
                 source.git.symbolic_ref("HEAD", "refs/heads/main")
                 self.check_backup(backup, root, source)
 
@@ -184,11 +188,66 @@ class HTTPBackupTests(unittest.TestCase):
                     self.fail("\n".join(logs.output))
                 with Repo(root / "test-org/survey.git") as destination:
                     self.assertEqual(source.git.show_ref(), destination.git.show_ref())
+                mirror_path = backup._repository_path(project)
+                with Repo(mirror_path) as mirror:
+                    self.assertTrue(mirror.bare)
+                    self.assertEqual(
+                        mirror.remotes.origin.url, project.http_url_to_repo
+                    )
+                    self.assertNotIn(
+                        server.source_token, Path(mirror.git_dir, "config").read_text()
+                    )
+                    self.assertNotIn(
+                        server.destination_token,
+                        Path(mirror.git_dir, "config").read_text(),
+                    )
+                    mirror.git.update_ref(
+                        "refs/heads/local-only", source.head.commit.hexsha
+                    )
+                # A new root commit simulates a non-fast-forward upstream rewrite.
+                with source.git.custom_environment(
+                    GIT_AUTHOR_NAME="Test",
+                    GIT_AUTHOR_EMAIL="test@example.invalid",
+                    GIT_COMMITTER_NAME="Test",
+                    GIT_COMMITTER_EMAIL="test@example.invalid",
+                ):
+                    rewritten = source.git.commit_tree(
+                        source.head.commit.tree.hexsha, m="Rewritten history"
+                    )
+                source.git.update_ref("refs/heads/main", rewritten)
+                source.git.update_ref("refs/tags/v1", rewritten)
                 source.git.update_ref("-d", "refs/heads/feature")
-                backup.run()
+                source.git.update_ref("-d", "refs/tags/delete-me")
+                source.git.update_ref("-d", "refs/notes/test")
+                with Repo(root / "test-org/survey.git") as destination:
+                    destination.git.update_ref(
+                        "refs/heads/destination-only",
+                        destination.heads.main.commit.hexsha,
+                    )
+                # Reconstruct the orchestrator to emulate a separate cron invocation.
+                restarted = make_backup()
+                restarted.__dict__.update(backup.__dict__)
+                with patch(
+                    "main.Repo.clone_from",
+                    side_effect=AssertionError("Unexpected reclone"),
+                ):
+                    restarted.run()
+                with Repo(mirror_path) as mirror:
+                    self.assertEqual(source.git.show_ref(), mirror.git.show_ref())
                 with Repo(root / "test-org/survey.git") as destination:
                     self.assertEqual(source.git.show_ref(), destination.git.show_ref())
                 self.assertEqual(server.created, 1)
+                # A failed fetch must not push stale refs or discard the local mirror.
+                backup.gitlab_token = "incorrect-source-token"
+                with (
+                    patch.object(backup, "_push_repository_with_retry") as push,
+                    self.assertRaises(SystemExit),
+                ):
+                    backup.run()
+                push.assert_not_called()
+                with Repo(mirror_path) as mirror:
+                    self.assertEqual(source.git.show_ref(), mirror.git.show_ref())
+                backup.gitlab_token = server.source_token
                 backup.gogs_token = "incorrect-test-token"
                 with self.assertRaises(SystemExit) as caught:
                     backup.run()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -59,7 +60,9 @@ class GitLabRetryTests(unittest.TestCase):
             return response(200, {"id": 1})
 
         with (
+            tempfile.TemporaryDirectory() as directory,
             patch.dict(os.environ, self.startup_environment, clear=True),
+            patch.dict(os.environ, {"GIT_PROJECT_DIR": directory}),
             patch("requests.Session.request", side_effect=request) as transport,
             patch("main.time.sleep", side_effect=sleep),
             patch("main.GitLabToGOGSBackup.run") as run,
@@ -81,7 +84,9 @@ class GitLabRetryTests(unittest.TestCase):
             reply._content = b"<html>Server unavailable: sensitive-response</html>"
             with (
                 self.subTest(status=status),
+                tempfile.TemporaryDirectory() as directory,
                 patch.dict(os.environ, self.startup_environment, clear=True),
+                patch.dict(os.environ, {"GIT_PROJECT_DIR": directory}),
                 patch("requests.Session.request", return_value=reply) as request,
                 patch("main.time.sleep") as sleep,
                 patch("main.GitLabToGOGSBackup.run") as run,

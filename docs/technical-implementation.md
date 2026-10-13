@@ -25,8 +25,12 @@ Responsibilities are split into helper methods:
   - `_get_full_project_with_retry()`
   - `_is_retryable_git_error()`
   - `_clone_repository_with_retry()`
+  - `_fetch_repository_with_retry()`
   - `_push_repository_with_retry()`
 - Backup orchestration:
+  - `_repository_path()`
+  - `_repository_lock()`
+  - `_clone_or_fetch_repository()`
   - `_backup_repository()`
   - `run()`
 
@@ -38,7 +42,9 @@ Responsibilities are split into helper methods:
    independently, including pagination requests.
 4. For each project:
    - Fetch full project details (with retry for transient API errors).
-   - Clone repository from GitLab (with retry for transient clone errors).
+   - Lock the project's persistent mirror for the entire fetch/push sequence.
+   - Clone a missing mirror or fetch the existing mirror from GitLab (with retry
+     for transient transport errors).
    - Ensure destination repo exists in GOGS.
    - Push mirror refs to GOGS (with retry for transient transport errors).
    - Check the push result for rejected refs before reporting success.
@@ -47,7 +53,7 @@ Responsibilities are split into helper methods:
 
 ## Retry model
 
-All GitLab and GOGS API requests and Git clone/push operations share
+All GitLab and GOGS API requests and Git clone/fetch/push operations share
 `_retry_operation()`:
 
 - Base delay: 2 seconds; maximum delay: 30 seconds.
@@ -60,7 +66,7 @@ All GitLab and GOGS API requests and Git clone/push operations share
 - No delay after the final failure; successful operations return immediately.
 - Authentication, permission, invalid-request, and repository rejection errors
   are not retried.
-- The backup always creates a fresh mirror clone; it has no `git pull` step.
+- Existing mirrors use forced, pruning fetches; there is no `git pull` step.
 
 ### GitLab API retry
 
@@ -92,7 +98,7 @@ a timed-out creation is treated as an already-existing repository.
 
 An exhausted or permanent GOGS request failure during backup is logged as a
 concise error without a traceback. The repository is included in the failure
-summary, its temporary clone is cleaned up, and the next project is processed.
+summary, its persistent mirror is retained, and the next project is processed.
 The run still exits nonzero if any repository failed.
 
 ### Clone retry
@@ -100,6 +106,39 @@ The run still exits nonzero if any repository failed.
 `_clone_repository_with_retry()` retries transient `GitCommandError` failures
 (e.g. HTTP 5xx/RPC/connectivity signatures). Before each attempt, it cleans the
 target clone path to avoid partial clone state issues.
+
+### Persistent mirrors and fetch retry
+
+`GIT_PROJECT_DIR` is required with no default. An unset or whitespace-only value
+fails before authentication. Mirrors live at
+`<GIT_PROJECT_DIR>/<sha256(gitlab_url)[:16]>/<project-id>.git`, keeping
+identities stable across project renames while separating GitLab instances. Use
+persistent storage for this directory in container deployments.
+
+Initial clones use a temporary staging directory on the same filesystem and are
+renamed into place only after success. Failed initial clones are cleaned up;
+existing mirrors are never deleted on fetch or push failures. Invalid or nonbare
+repositories fail the project without being overwritten.
+
+`origin` remains the GitLab remote; its URL is refreshed on each fetch to follow
+project moves. Existing mirrors run the equivalent of:
+
+```bash
+git fetch --atomic --force --prune origin '+refs/*:refs/*'
+```
+
+The forced refspec overwrites rewritten branches and tags, and pruning covers
+all refs in that mapping, including deleted tags. Atomic fetch updates all refs
+or none. See the [Git fetch documentation](https://git-scm.com/docs/git-fetch).
+Transient fetch failures use the shared retry policy; a terminal fetch failure
+prevents the GOGS push, so stale local refs cannot be reported as a fresh
+backup.
+
+GOGS uses a separate `gogs` remote with no fetch refspec, avoiding destination
+tracking refs inside the mirror. A per-project advisory `flock` (Linux/macOS)
+spans clone/fetch and push. Lock contention fails that project and processing
+continues; lock files remain, while OS locks release when the process exits.
+Mirrors for archived or removed projects remain on disk without further updates.
 
 ### Push retry
 
@@ -109,13 +148,14 @@ failures are retried; authentication and permission failures are terminal.
 
 ## Git authentication
 
-Both clone and push use a temporary `GIT_ASKPASS` shell helper with credentials
-supplied through the subprocess environment. The helper file contains no secrets
-and is removed after the operation. Terminal prompts and credential caching are
-disabled. Clone credentials are removed from the returned GitPython `Repo`
-environment before it is reused for the GOGS push. Repository URLs contain no
-credentials, including on failure paths. HTTP and HTTPS use the same mechanism.
-See [Git credential handling](https://git-scm.com/docs/gitcredentials) and
+Clone, fetch, and push use a temporary `GIT_ASKPASS` shell helper with
+credentials supplied through the subprocess environment. The helper file
+contains no secrets and is removed after the operation. Terminal prompts and
+credential caching are disabled. Clone credentials are removed from the returned
+GitPython `Repo` environment before it is reused for the GOGS push. Repository
+URLs contain no credentials, including on failure paths. HTTP and HTTPS use the
+same mechanism. See
+[Git credential handling](https://git-scm.com/docs/gitcredentials) and
 [GitPython push results](https://gitpython.readthedocs.io/en/stable/reference.html#git.remote.PushInfoList.raise_if_error).
 
 `GITLAB_HOST_URL` accepts a hostname (defaults to HTTPS) or a full HTTP(S) URL.

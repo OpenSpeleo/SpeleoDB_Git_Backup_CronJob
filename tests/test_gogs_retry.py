@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
@@ -128,7 +130,8 @@ class GOGSRetryTests(unittest.TestCase):
             backup.gl.projects.get.side_effect = projects
             with (
                 self.subTest(failure=failure),
-                patch.object(backup, "_clone_repository_with_retry", side_effect=repos),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(backup, "_clone_or_fetch_repository", side_effect=repos),
                 patch.object(backup, "_push_repository_with_retry") as push,
                 patch(
                     "main.requests.request",
@@ -138,6 +141,7 @@ class GOGSRetryTests(unittest.TestCase):
                 self.assertLogs("main", level="INFO") as logs,
                 self.assertRaises(SystemExit) as caught,
             ):
+                backup.backup_dir = Path(directory)
                 backup.run()
             self.assertEqual(caught.exception.code, 1)
             self.assertEqual(request.call_count, 7)

@@ -68,6 +68,7 @@ class BackupTests(unittest.TestCase):
         ):
             with (
                 self.subTest(host=host),
+                tempfile.TemporaryDirectory() as directory,
                 patch.dict(
                     os.environ,
                     {
@@ -78,6 +79,7 @@ class BackupTests(unittest.TestCase):
                         "GOGS_USERNAME": "backup-user",
                         "GOGS_ACCESS_TOKEN": "destination-test-token",
                         "GOGS_ORG": "",
+                        "GIT_PROJECT_DIR": directory,
                     },
                     clear=True,
                 ),
@@ -88,6 +90,17 @@ class BackupTests(unittest.TestCase):
                 client.assert_called_once_with(
                     expected, private_token="source-test-token", timeout=30
                 )
+
+    def test_backup_dir_is_required_before_network_calls(self) -> None:
+        for environment in ({}, {"GIT_PROJECT_DIR": ""}, {"GIT_PROJECT_DIR": "   "}):
+            with (
+                self.subTest(environment=environment),
+                patch.dict(os.environ, environment, clear=True),
+                patch("main.RetryingGitlab") as client,
+                self.assertRaisesRegex(ValueError, "GIT_PROJECT_DIR is required"),
+            ):
+                GitLabToGOGSBackup()
+            client.assert_not_called()
 
     def test_rejects_invalid_urls_without_echoing_secrets(self) -> None:
         backup = make_backup()
