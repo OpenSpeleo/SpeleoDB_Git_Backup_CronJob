@@ -15,8 +15,12 @@ import shutil
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Any
 from urllib.parse import quote
@@ -46,6 +50,18 @@ MAX_RETRIES = 5
 RETRY_BASE_DELAY_SECONDS = 2
 RETRY_MAX_DELAY_SECONDS = 30
 TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+@dataclass(frozen=True, slots=True)
+class BackupProject:
+    """Immutable backup inputs, detached from the main thread's GitLab client."""
+
+    id: int
+    name: str
+    path_with_namespace: str
+    description: str
+    visibility: str
+    http_url_to_repo: str
 
 
 def _request_error_summary(error: Exception) -> str:
@@ -156,6 +172,14 @@ class GitLabToGOGSBackup:
         if not backup_dir:
             raise ValueError("GIT_PROJECT_DIR is required and must not be empty")
         self.backup_dir = Path(backup_dir).expanduser().resolve()
+        try:
+            self.parallel_threads = int(os.environ.get("BACKUP_PARALLEL_THREADS", "1"))
+        except ValueError:
+            raise ValueError(
+                "BACKUP_PARALLEL_THREADS must be an integer >= 1"
+            ) from None
+        if self.parallel_threads < 1:
+            raise ValueError("BACKUP_PARALLEL_THREADS must be an integer >= 1")
 
         # GOGS configuration
         self.gogs_url = os.environ.get("GOGS_INSTANCE_URL", "")
@@ -170,6 +194,7 @@ class GitLabToGOGSBackup:
         logger.info(f"GitLab URL: {self.gitlab_url}")
         logger.info(f"GitLab Group ID: {self.gitlab_group_id}")
         logger.info("Git project directory: %s", self.backup_dir)
+        logger.info("Backup parallel threads: %s", self.parallel_threads)
         logger.info(f"GOGS URL: {self.gogs_url}")
         logger.info(f"GOGS Username: {self.gogs_username}")
         logger.info(
@@ -183,10 +208,12 @@ class GitLabToGOGSBackup:
         self.gl.auth()
 
         # GOGS API headers
-        self.gogs_headers = {
-            "Authorization": f"token {self.gogs_token}",
-            "Content-Type": "application/json",
-        }
+        self.gogs_headers = MappingProxyType(
+            {
+                "Authorization": f"token {self.gogs_token}",
+                "Content-Type": "application/json",
+            }
+        )
 
         # Verify GOGS organization exists if specified
         if self.gogs_org:
@@ -314,7 +341,7 @@ class GitLabToGOGSBackup:
             }
 
     def _clone_repository_with_retry(
-        self, project: Any, destination_dir: str, retries: int = MAX_RETRIES
+        self, project: BackupProject, destination_dir: str, retries: int = MAX_RETRIES
     ) -> Repo:
         """Clone a GitLab repository with exponential backoff on transient failures."""
         clone_path = Path(destination_dir) / "mirror-repo.git"
@@ -335,7 +362,7 @@ class GitLabToGOGSBackup:
             clone, f"Git clone of {project.name}", self._is_retryable_git_error, retries
         )
 
-    def _repository_path(self, project: Any) -> Path:
+    def _repository_path(self, project: BackupProject) -> Path:
         """Keep project renames stable and separate different GitLab instances."""
         instance = hashlib.sha256(self.gitlab_url.encode()).hexdigest()[:16]
         return self.backup_dir / instance / f"{int(project.id)}.git"
@@ -357,7 +384,7 @@ class GitLabToGOGSBackup:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
-    def _fetch_repository_with_retry(self, repo: Repo, project: Any) -> None:
+    def _fetch_repository_with_retry(self, repo: Repo, project: BackupProject) -> None:
         """Replace all local refs with upstream refs, including rewritten tags."""
         gitlab_url = self._validate_http_url(
             project.http_url_to_repo, "GitLab repository URL"
@@ -376,7 +403,9 @@ class GitLabToGOGSBackup:
             )
         logger.info("Successfully fetched %s from GitLab", project.name)
 
-    def _clone_or_fetch_repository(self, project: Any, repo_path: Path) -> Repo:
+    def _clone_or_fetch_repository(
+        self, project: BackupProject, repo_path: Path
+    ) -> Repo:
         """Publish only complete clones; preserve existing mirrors on failure."""
         if not repo_path.exists():
             logger.info("Cloning %s from GitLab...", project.name)
@@ -449,7 +478,11 @@ class GitLabToGOGSBackup:
 
         def request() -> requests.Response:
             response = requests.request(
-                method=method, url=url, headers=self.gogs_headers, json=data, timeout=30
+                method=method,
+                url=url,
+                headers=dict(self.gogs_headers),
+                json=data,
+                timeout=30,
             )
             response.raise_for_status()
             return response
@@ -475,7 +508,7 @@ class GitLabToGOGSBackup:
                 return False
             raise
 
-    def _create_gogs_repo(self, project: Any) -> dict[str, Any]:
+    def _create_gogs_repo(self, project: BackupProject) -> dict[str, Any]:
         """Create a repository in GOGS."""
         repo_data = {
             "name": project.name,
@@ -540,7 +573,7 @@ class GitLabToGOGSBackup:
                 retries,
             )
 
-    def _backup_repository(self, project: Any) -> None:
+    def _backup_repository(self, project: BackupProject) -> None:
         """Backup a single repository from GitLab to GOGS."""
         repo_path = self._repository_path(project)
         with self._repository_lock(repo_path):
@@ -574,71 +607,111 @@ class GitLabToGOGSBackup:
                 if repo is not None:
                     repo.close()
 
-    def run(self):
-        """Run the backup process for all repositories in the GitLab group."""
-        try:
-            # Get GitLab group
-            group = self.gl.groups.get(self.gitlab_group_id)
-            logger.info(f"Found GitLab group: {group.name}")
+    def _prepare_projects(
+        self, projects: list[Any]
+    ) -> tuple[dict[int, BackupProject], dict[int, tuple[str, str]]]:
+        """Load all metadata on the calling thread before any backups start."""
+        prepared: dict[int, BackupProject] = {}
+        failed: dict[int, tuple[str, str]] = {}
+        seen_ids: set[int] = set()
+        for idx, project in enumerate(projects):
+            project_id = int(project.id)
+            if project_id in seen_ids:
+                logger.info("Skipping repeated GitLab project id=%s", project_id)
+                continue
+            seen_ids.add(project_id)
+            display_name = (
+                getattr(project, "path_with_namespace", None)
+                or getattr(project, "name", None)
+                or str(project_id)
+            )
+            full_project = self._get_full_project_with_retry(project_id, display_name)
+            if full_project is None:
+                failed[idx] = (
+                    display_name,
+                    "Failed to load project details after retries",
+                )
+                continue
+            try:
+                prepared[idx] = BackupProject(
+                    id=project_id,
+                    name=full_project.name,
+                    path_with_namespace=full_project.path_with_namespace,
+                    description=full_project.description or "",
+                    visibility=full_project.visibility,
+                    http_url_to_repo=self._validate_http_url(
+                        full_project.http_url_to_repo, "GitLab repository URL"
+                    ),
+                )
+            except Exception as error:
+                logger.exception("Failed to prepare backup of %s", display_name)
+                failed[idx] = (display_name, str(error))
+        return prepared, failed
 
-            # Get all projects in the group (including subgroups)
+    def _backup_project(self, project: BackupProject, idx: int, total: int) -> None:
+        """Run one independent job; results and GitLab access belong to the caller."""
+        logger.info(
+            "[%03d/%03d] Starting backup of %s",
+            idx + 1,
+            total,
+            project.path_with_namespace,
+        )
+        self._backup_repository(project)
+
+    def _backup_projects(
+        self, projects: dict[int, BackupProject], total: int
+    ) -> tuple[list[str], dict[int, tuple[str, str]]]:
+        """Only the calling thread submits work and records completed futures."""
+        successful: list[str] = []
+        failed: dict[int, tuple[str, str]] = {}
+        if not projects:
+            return successful, failed
+
+        first_project = next(iter(projects.values()))
+        self._repository_path(first_project).parent.mkdir(parents=True, exist_ok=True)
+        # Workers only read configuration. Repo handles, HTTP sessions, temporary
+        # paths, and Git environments are created inside each individual job.
+        with ThreadPoolExecutor(
+            max_workers=self.parallel_threads, thread_name_prefix="backup"
+        ) as executor:
+            futures = {
+                executor.submit(self._backup_project, project, idx, total): idx
+                for idx, project in projects.items()
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                project = projects[idx]
+                try:
+                    future.result()
+                    successful.append(project.name)
+                except requests.exceptions.RequestException as error:
+                    reason = f"GOGS API request failed: {_request_error_summary(error)}"
+                    logger.error(  # noqa: TRY400 - expected request failure
+                        "Failed to backup %s: %s. Skipping project.",
+                        project.name,
+                        reason,
+                    )
+                    failed[idx] = (project.name, reason)
+                except Exception as error:
+                    logger.exception("Failed to backup %s", project.name)
+                    failed[idx] = (project.name, str(error))
+        return successful, failed
+
+    def run(self) -> None:
+        """Prepare on the main thread, back up independently, then report results."""
+        try:
+            group = self.gl.groups.get(self.gitlab_group_id)
+            logger.info("Found GitLab group: %s", group.name)
             projects = group.projects.list(
                 all=True,
                 include_subgroups=True,
-                archived=False,  # Skip archived projects
+                archived=False,
             )
+            logger.info("Found %s projects to backup", len(projects))
 
-            logger.info(f"Found {len(projects)} projects to backup")
-
-            # Track results
-            successful = []
-            failed = []
-
-            # Backup each repository
-            for idx, project in enumerate(projects):
-                logger.info("")  # Visual Spacing
-                project_display_name = (
-                    getattr(project, "path_with_namespace", None)
-                    or getattr(project, "name", None)
-                    or str(project.id)
-                )
-
-                # Get full project details with retries for transient failures
-                full_project = self._get_full_project_with_retry(
-                    project.id,
-                    project_display_name,
-                )
-                if full_project is None:
-                    failed.append(
-                        (
-                            project_display_name,
-                            "Failed to load project details after retries",
-                        )
-                    )
-                    continue
-
-                logger.info(
-                    f"[{idx + 1:03d}/{len(projects):03d}] Starting backup of "
-                    f"{full_project.path_with_namespace}"
-                )
-
-                try:
-                    self._backup_repository(full_project)
-                    successful.append(full_project.name)
-                except requests.exceptions.RequestException as error:
-                    # Avoid dumping request details or credentials into the logs.
-                    reason = f"GOGS API request failed: {type(error).__name__}"
-                    if error.response is not None:
-                        reason += f" (HTTP {error.response.status_code})"
-                    logger.error(  # noqa: TRY400 - skip expected request failures
-                        "Failed to backup %s: %s. Skipping project.",
-                        full_project.name,
-                        reason,
-                    )
-                    failed.append((full_project.name, reason))
-                except Exception as e:
-                    logger.exception(f"Failed to backup {full_project.name}")
-                    failed.append((full_project.name, str(e)))
+            prepared, failed = self._prepare_projects(projects)
+            successful, backup_failures = self._backup_projects(prepared, len(projects))
+            failed.update(backup_failures)
 
             # Summary
             logger.info("\nBackup Summary:")
@@ -647,7 +720,8 @@ class GitLabToGOGSBackup:
 
             if failed:
                 logger.error("\nFailed repositories:")
-                for repo_name, error in failed:
+                for idx in sorted(failed):
+                    repo_name, error = failed[idx]
                     logger.error(f"  - {repo_name}: {error}")
 
                 # Exit with error code if any backups failed

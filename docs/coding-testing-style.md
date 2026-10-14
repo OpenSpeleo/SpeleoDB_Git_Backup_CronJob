@@ -44,6 +44,13 @@ temporary repositories, with a simulated GitLab group and GOGS API. It verifies
 real mirror transfers without touching production. A live test-group check
 remains useful when changing provider-specific API behavior.
 
+Parallel backup tests use bounded barriers/events to verify overlap and worker
+limits without relying on timing guesses. They check that all GitLab metadata is
+loaded before workers start, frozen inputs are detached from SDK objects,
+results are collected on the main thread, and retries/credentials remain
+independent. The loopback HTTP fixture exercises concurrent clone, fetch, and
+push for multiple disposable repositories. Mutable fixture counters are locked.
+
 Recommended behavior tests:
 
 - Run against a small GitLab test group with known repositories.

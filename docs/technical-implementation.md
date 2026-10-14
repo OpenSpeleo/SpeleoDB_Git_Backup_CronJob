@@ -32,6 +32,9 @@ Responsibilities are split into helper methods:
   - `_repository_lock()`
   - `_clone_or_fetch_repository()`
   - `_backup_repository()`
+  - `_prepare_projects()`
+  - `_backup_project()`
+  - `_backup_projects()`
   - `run()`
 
 ## Runtime flow
@@ -40,16 +43,49 @@ Responsibilities are split into helper methods:
 2. Authenticate against GitLab, with retry for transient API errors.
 3. Resolve GitLab group and list eligible projects, retrying each API request
    independently, including pagination requests.
-4. For each project:
-   - Fetch full project details (with retry for transient API errors).
+4. On the main thread, deduplicate project IDs, fetch all full project details
+   with retries, and copy backup inputs into frozen `BackupProject` records.
+   Record metadata failures without submitting those projects.
+5. Prepare the shared mirror parent directory and submit each prepared project
+   to `ThreadPoolExecutor(max_workers=BACKUP_PARALLEL_THREADS)`. Each job:
    - Lock the project's persistent mirror for the entire fetch/push sequence.
    - Clone a missing mirror or fetch the existing mirror from GitLab (with retry
      for transient transport errors).
    - Ensure destination repo exists in GOGS.
    - Push mirror refs to GOGS (with retry for transient transport errors).
    - Check the push result for rejected refs before reporting success.
-   - Record success or failure.
-5. Emit summary and exit non-zero when failures are present.
+6. On the main thread, collect completed futures with `as_completed()`, record
+   successes and failures, and wait for executor shutdown.
+7. Emit a summary in discovery order and exit non-zero when failures are
+   present.
+
+## Parallelism and ownership
+
+`BACKUP_PARALLEL_THREADS` defaults to `1` and must parse as an integer >= 1. An
+explicitly empty or invalid value fails before network calls. The same executor
+path handles sequential and parallel backups; no executor is created when
+preparation produces no jobs.
+
+`BackupProject` contains only the project ID, name, namespace path, description,
+visibility, and repository URL. No GitLab SDK object or session is passed to a
+worker. Shared configuration is read only during execution; GOGS headers are
+stored in an immutable mapping and copied for each request. `requests.request()`
+creates a separate session for each call. Each job creates and closes its own
+GitPython repository/remotes, credential environment, and temporary directories.
+Workers do not change the process environment or working directory.
+
+Unique UUID project names in the configured source organization identify unique
+GOGS destinations. Repeated project IDs are skipped before metadata retrieval,
+so a local mirror is scheduled at most once. The existing nonblocking per-mirror
+file lock also protects against overlapping cron invocations using that mirror.
+
+Only the main thread submits futures, waits for their results, and updates
+result collections. Workers never wait on another job or submit nested work. A
+retry sleeps only its own worker. Logging uses Python's thread-safe logging
+machinery; progress messages may interleave, while failure summaries use
+discovery order. No additional application locks are required between workers.
+Higher parallelism increases resource usage and simultaneous load on both Git
+servers.
 
 ## Retry model
 

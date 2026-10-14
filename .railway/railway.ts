@@ -30,6 +30,7 @@ export default defineRailway(() => {
     },
     // IaC treats omitted variables as deletions; retain their Railway values.
     env: {
+      BACKUP_PARALLEL_THREADS: preserve(),
       FORCE_REBUILD_COUNTER: preserve(),
       GITLAB_GROUP_ID: preserve(),
       GITLAB_GROUP_NAME: preserve(),

@@ -117,7 +117,14 @@ class GOGSRetryTests(unittest.TestCase):
     def test_exhaustion_skips_project_without_traceback_and_cleans_up(self) -> None:
         backup = make_backup()
         projects = [
-            SimpleNamespace(id=i, name=f"survey{i}", path_with_namespace=f"group/s{i}")
+            SimpleNamespace(
+                id=i,
+                name=f"survey{i}",
+                path_with_namespace=f"group/s{i}",
+                description="",
+                visibility="private",
+                http_url_to_repo=f"https://gitlab.test/group/s{i}.git",
+            )
             for i in range(2)
         ]
         backup.gl = MagicMock()

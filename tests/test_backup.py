@@ -23,6 +23,7 @@ from main import GitLabToGOGSBackup
 
 def make_backup() -> GitLabToGOGSBackup:
     backup = GitLabToGOGSBackup.__new__(GitLabToGOGSBackup)
+    backup.parallel_threads = 1
     backup.gitlab_url = "https://gitlab.com"
     backup.gitlab_token = "source-test-token"
     backup.gitlab_group_id = "1"
@@ -214,7 +215,12 @@ class BackupTests(unittest.TestCase):
         backup = make_backup()
         projects = [
             SimpleNamespace(
-                id=i, name=f"survey{i}", path_with_namespace=f"group/survey{i}"
+                id=i,
+                name=f"survey{i}",
+                path_with_namespace=f"group/survey{i}",
+                description="",
+                visibility="private",
+                http_url_to_repo=f"https://gitlab.test/group/survey{i}.git",
             )
             for i in range(2)
         ]
@@ -222,12 +228,14 @@ class BackupTests(unittest.TestCase):
         backup.gl.groups.get.return_value.projects.list.return_value = projects
         backup.gl.projects.get.side_effect = projects
         with (
+            tempfile.TemporaryDirectory() as directory,
             patch.object(
                 backup, "_backup_repository", side_effect=[RuntimeError("bad"), None]
             ) as run,
             self.assertLogs("main", level="INFO") as logs,
             self.assertRaises(SystemExit) as caught,
         ):
+            backup.backup_dir = Path(directory)
             backup.run()
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(run.call_count, 2)

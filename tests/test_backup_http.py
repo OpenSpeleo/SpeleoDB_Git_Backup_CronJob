@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ from git import Repo
 from tests.test_backup import make_backup
 
 if TYPE_CHECKING:
+    from main import BackupProject
     from main import GitLabToGOGSBackup
 
 # The fixture executes the installed git binary against disposable local repositories.
@@ -36,8 +38,14 @@ class GitHTTPServer(ThreadingHTTPServer):
     source_token: str
     destination_token: str
     username: str
-    created: int = 0
-    lookup_failures_remaining: int = 1
+
+    def __init__(
+        self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]
+    ) -> None:
+        super().__init__(address, handler)
+        self.created = 0
+        self.lookup_failures_remaining = 1
+        self.state_lock = threading.Lock()
 
 
 class GitHTTPHandler(BaseHTTPRequestHandler):
@@ -114,27 +122,151 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         ):
             self.respond(401)
             return
-        if self.command == "GET":
-            if self.server.lookup_failures_remaining:
-                self.server.lookup_failures_remaining -= 1
-                self.respond(503)
+        with self.server.state_lock:
+            if self.command == "GET":
+                if self.server.lookup_failures_remaining:
+                    self.server.lookup_failures_remaining -= 1
+                    self.respond(503)
+                    return
+                name = path.rsplit("/", 1)[-1]
+                exists = (self.server.root / "test-org" / f"{name}.git").exists()
+                self.respond(200 if exists else 404)
                 return
-            exists = (self.server.root / "test-org/survey.git").exists()
-            self.respond(200 if exists else 404)
-            return
-        assert path == "/api/v1/org/test-org/repos"
-        data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        assert data["name"] == "survey"
-        with (
-            Repo.init(self.server.root / "test-org/survey.git", bare=True) as repo,
-            repo.config_writer() as config,
-        ):
-            config.set_value("http", "receivepack", "true")
-        self.server.created += 1
-        self.respond(201, b'{"name":"survey"}')
+            assert path == "/api/v1/org/test-org/repos"
+            data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            name = data["name"]
+            assert "/" not in name
+            assert ".." not in name
+            with (
+                Repo.init(
+                    self.server.root / "test-org" / f"{name}.git", bare=True
+                ) as repo,
+                repo.config_writer() as config,
+            ):
+                config.set_value("http", "receivepack", "true")
+            self.server.created += 1
+            self.respond(201, json.dumps({"name": name}).encode())
 
 
 class HTTPBackupTests(unittest.TestCase):
+    def test_parallel_initial_and_incremental_mirrors(self) -> None:
+        backup = make_backup()
+        backup.parallel_threads = 2
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            backup.backup_dir = root / "mirrors"
+            server = GitHTTPServer(("127.0.0.1", 0), GitHTTPHandler)
+            server.root = root
+            server.source_token = backup.gitlab_token
+            server.destination_token = backup.gogs_token
+            server.username = backup.gogs_username
+            server.lookup_failures_remaining = 0
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            stack.callback(thread.join, timeout=5)
+            stack.callback(server.server_close)
+            stack.callback(server.shutdown)
+            backup.gogs_url = f"http://127.0.0.1:{server.server_port}"
+            sources = []
+            projects = []
+            for idx in range(4):
+                name = f"00000000-0000-0000-0000-{idx:012d}"
+                source = stack.enter_context(
+                    Repo.init(root / "source" / f"{name}.git", bare=True)
+                )
+                tree = source.git.hash_object("-t", "tree", "--stdin", istream=None)
+                with source.git.custom_environment(
+                    GIT_AUTHOR_NAME="Test",
+                    GIT_AUTHOR_EMAIL="test@example.invalid",
+                    GIT_COMMITTER_NAME="Test",
+                    GIT_COMMITTER_EMAIL="test@example.invalid",
+                ):
+                    commit = source.git.commit_tree(tree, m=name)
+                source.git.update_ref("refs/heads/main", commit)
+                source.git.update_ref("refs/tags/v1", commit)
+                source.git.symbolic_ref("HEAD", "refs/heads/main")
+                sources.append(source)
+                projects.append(
+                    SimpleNamespace(
+                        id=idx,
+                        name=name,
+                        path_with_namespace=f"test-group/{name}",
+                        description="Parallel HTTP fixture",
+                        visibility="private",
+                        http_url_to_repo=f"{backup.gogs_url}/source/{name}.git",
+                    )
+                )
+            backup.gl = MagicMock()
+            backup.gl.groups.get.return_value.projects.list.return_value = projects
+            backup.gl.projects.get.side_effect = lambda idx: projects[idx]
+            barrier = threading.Barrier(2, timeout=10)
+            handles = []
+            handles_lock = threading.Lock()
+            clone_or_fetch = backup._clone_or_fetch_repository
+
+            def synchronized_transfer(project: BackupProject, path: Path) -> Repo:
+                barrier.wait()
+                repo = clone_or_fetch(project, path)
+                with handles_lock:
+                    handles.append(repo)
+                return repo
+
+            original_environment = dict(os.environ)
+            with self.assertLogs("main", level="INFO") as logs:
+                for incremental in (False, True):
+                    if incremental:
+                        for source in sources:
+                            source.git.update_ref(
+                                "refs/heads/new", source.head.commit.hexsha
+                            )
+                            source.git.update_ref("-d", "refs/tags/v1")
+                    with ExitStack() as phase:
+                        phase.enter_context(
+                            patch.object(
+                                backup,
+                                "_clone_or_fetch_repository",
+                                new=synchronized_transfer,
+                            )
+                        )
+                        if incremental:
+                            phase.enter_context(
+                                patch(
+                                    "main.Repo.clone_from",
+                                    side_effect=AssertionError("Unexpected reclone"),
+                                )
+                            )
+                        backup.run()
+                    for project, source in zip(projects, sources, strict=True):
+                        with (
+                            Repo(
+                                root / "test-org" / f"{project.name}.git"
+                            ) as destination,
+                            Repo(backup._repository_path(project)) as mirror,
+                        ):
+                            self.assertEqual(
+                                source.git.show_ref(), destination.git.show_ref()
+                            )
+                            self.assertEqual(
+                                source.git.show_ref(), mirror.git.show_ref()
+                            )
+                            config = Path(mirror.git_dir, "config").read_text()
+                            self.assertNotIn(backup.gitlab_token, config)
+                            self.assertNotIn(backup.gogs_token, config)
+                # One failed fetch cannot prevent the other parallel backups.
+                projects[0].http_url_to_repo = f"{backup.gogs_url}/source/missing.git"
+                with self.assertRaises(SystemExit) as caught:
+                    backup.run()
+                self.assertEqual(caught.exception.code, 1)
+            output = "\n".join(logs.output)
+            self.assertIn("Successful: 4 repositories", output)
+            self.assertIn("Successful: 3 repositories", output)
+            self.assertIn("Failed: 1 repositories", output)
+            self.assertNotIn(backup.gitlab_token, output)
+            self.assertNotIn(backup.gogs_token, output)
+            self.assertEqual(server.created, 4)
+            self.assertEqual(len({id(repo) for repo in handles}), 8)
+            self.assertEqual(os.environ, original_environment)
+
     def test_authenticated_mirror_and_failure_reporting(self) -> None:
         backup = make_backup()
         with tempfile.TemporaryDirectory() as directory:

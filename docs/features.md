@@ -13,6 +13,10 @@
 - Creates destination repositories in GOGS when missing.
 - Pushes all refs to GOGS with mirror push.
 - Authenticates Git operations over HTTP and HTTPS without credentials in URLs.
+- Backs up independent repositories with a configurable thread pool. Set
+  `BACKUP_PARALLEL_THREADS` to an integer >= 1; the default is `1`.
+- Completes all GitLab metadata loading on the main thread before workers start,
+  passing immutable project records to workers and collecting results centrally.
 
 ## Reliability features
 
@@ -40,6 +44,9 @@
 ## Operational behavior
 
 - Validates required environment variables at startup.
+- Rejects invalid `BACKUP_PARALLEL_THREADS` values before network calls.
+- Deduplicates repeated source project IDs before scheduling backups;
+  destination names remain the source's unique UUID names.
 - Refuses to start when `GIT_PROJECT_DIR` is unset or empty; tests use temporary
   directories without requiring this variable in the shell environment.
 - Verifies target GOGS organization access when organization mode is enabled.

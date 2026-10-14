@@ -13,6 +13,10 @@ GitLab group (including subgroups) into a GOGS instance.
 - Authenticates to GitLab using a personal access token.
 - Lists all eligible repositories from the configured GitLab group.
 - Fetches full project details before backup.
+- Loads all GitLab metadata on the main thread, then backs up repositories in
+  independent workers using `BACKUP_PARALLEL_THREADS` (integer >= 1, default 1).
+- Shares only read-only configuration and frozen project records with workers;
+  the main thread collects backup results.
 - Clones each repository as a mirror.
 - Creates missing destination repositories in GOGS.
 - Pushes all refs/tags/branches to GOGS using mirror push.

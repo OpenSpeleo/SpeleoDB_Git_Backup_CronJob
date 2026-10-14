@@ -6,16 +6,17 @@ Mirrors non-archived GitLab group repositories (including subgroups) to GOGS.
 
 Set these environment variables on the backup service:
 
-| Variable            | Value / purpose                                                          |
-| ------------------- | ------------------------------------------------------------------------ |
-| `GITLAB_HOST_URL`   | `gitlab.com` (default), or a full HTTP(S) URL                            |
-| `GITLAB_TOKEN`      | GitLab token with API and repository read access                         |
-| `GITLAB_GROUP_ID`   | Source GitLab group ID                                                   |
-| `GIT_PROJECT_DIR`   | Required writable directory for persistent local Git mirrors; no default |
-| `GOGS_INSTANCE_URL` | Full base URL, e.g. `http://gogs.railway.internal:3000`                  |
-| `GOGS_USERNAME`     | GOGS account used for Git authentication                                 |
-| `GOGS_ACCESS_TOKEN` | GOGS token with access to create and push destination repos              |
-| `GOGS_ORG`          | Optional destination organization; empty uses personal repos             |
+| Variable                  | Value / purpose                                                          |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `GITLAB_HOST_URL`         | `gitlab.com` (default), or a full HTTP(S) URL                            |
+| `GITLAB_TOKEN`            | GitLab token with API and repository read access                         |
+| `GITLAB_GROUP_ID`         | Source GitLab group ID                                                   |
+| `GIT_PROJECT_DIR`         | Required writable directory for persistent local Git mirrors; no default |
+| `BACKUP_PARALLEL_THREADS` | Maximum concurrent repository backups; integer >= 1, default `1`         |
+| `GOGS_INSTANCE_URL`       | Full base URL, e.g. `http://gogs.railway.internal:3000`                  |
+| `GOGS_USERNAME`           | GOGS account used for Git authentication                                 |
+| `GOGS_ACCESS_TOKEN`       | GOGS token with access to create and push destination repos              |
+| `GOGS_ORG`                | Optional destination organization; empty uses personal repos             |
 
 Git authenticates non-interactively over HTTP or HTTPS using `GIT_ASKPASS`.
 Tokens are passed through the Git subprocess environment, not repository URLs or
@@ -42,6 +43,21 @@ objects. Forced fetches replace rewritten branches and tags and prune deleted
 refs before pushing to GOGS, so GitLab always wins. No merge or rebase is
 performed. Local mirrors for removed or archived projects are retained but are
 no longer updated.
+
+Set `BACKUP_PARALLEL_THREADS=4`, for example, to back up up to four repositories
+concurrently. Unset means `1`; empty, non-integer, zero, and negative values
+fail at startup before network calls. Higher counts increase CPU, memory, disk,
+and network usage.
+
+The main thread completes authentication, project discovery, and all GitLab
+metadata requests before starting backups. Workers receive immutable project
+records and independently clone/fetch, check or create their GOGS repository,
+and push. GitLab project IDs are deduplicated before metadata loading.
+Repository names are assumed unique (UUIDs in the configured source
+organization). Each worker owns its repository handles, temporary files,
+credentials, and HTTP request state; shared configuration is only read. The main
+thread collects results and reports failures after every backup finishes.
+Progress logs can interleave; failure summaries retain discovery order.
 
 ## Troubleshooting
 
@@ -87,5 +103,10 @@ also verifies persistent reuse, upstream history rewrites, moved/deleted tags,
 and failed-fetch handling. It does not contact production services or require
 production credentials or `GIT_PROJECT_DIR` in the shell environment; tests
 supply their own temporary directories.
+
+Concurrency tests use bounded barriers and events to verify worker limits,
+metadata preparation, duplicate handling, and failure/retry isolation. The HTTP
+fixture also checks parallel initial and incremental backups of multiple
+repositories.
 
 See [the documentation index](docs/README.md) for implementation details.
