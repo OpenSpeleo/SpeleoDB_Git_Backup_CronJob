@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+from git import GitCommandError
 from git import Repo
 
 from tests.test_backup import make_backup
@@ -198,7 +199,9 @@ class HTTPBackupTests(unittest.TestCase):
                 )
             backup.gl = MagicMock()
             backup.gl.groups.get.return_value.projects.list.return_value = projects
-            backup.gl.projects.get.side_effect = lambda idx: projects[idx]
+            backup.gl.projects.get.side_effect = AssertionError(
+                "Unexpected detail request"
+            )
             barrier = threading.Barrier(2, timeout=10)
             handles = []
             handles_lock = threading.Lock()
@@ -252,6 +255,10 @@ class HTTPBackupTests(unittest.TestCase):
                             config = Path(mirror.git_dir, "config").read_text()
                             self.assertNotIn(backup.gitlab_token, config)
                             self.assertNotIn(backup.gogs_token, config)
+                with patch.object(backup, "_push_repository_with_retry") as push:
+                    backup.run()
+                push.assert_not_called()
+                backup.gl.projects.get.assert_not_called()
                 # One failed fetch cannot prevent the other parallel backups.
                 projects[0].http_url_to_repo = f"{backup.gogs_url}/source/missing.git"
                 with self.assertRaises(SystemExit) as caught:
@@ -312,7 +319,9 @@ class HTTPBackupTests(unittest.TestCase):
             )
             backup.gl = MagicMock()
             backup.gl.groups.get.return_value.projects.list.return_value = [project]
-            backup.gl.projects.get.return_value = project
+            backup.gl.projects.get.side_effect = AssertionError(
+                "Unexpected detail request"
+            )
             with self.assertLogs("main", level="INFO") as logs:
                 try:
                     backup.run()
@@ -369,6 +378,46 @@ class HTTPBackupTests(unittest.TestCase):
                 with Repo(root / "test-org/survey.git") as destination:
                     self.assertEqual(source.git.show_ref(), destination.git.show_ref())
                 self.assertEqual(server.created, 1)
+                with patch.object(backup, "_push_repository_with_retry") as push:
+                    backup.run()
+                push.assert_not_called()
+                # A failed push must be retried next run even if fetch changes nothing.
+                source.git.update_ref("refs/tags/retry", source.head.commit.hexsha)
+                with (
+                    patch.object(
+                        backup,
+                        "_push_repository_with_retry",
+                        side_effect=GitCommandError("git push", 128, stderr="fixture"),
+                    ),
+                    self.assertRaises(SystemExit),
+                ):
+                    backup.run()
+                with patch.object(
+                    backup,
+                    "_push_repository_with_retry",
+                    wraps=backup._push_repository_with_retry,
+                ) as push:
+                    backup.run()
+                self.assertEqual(push.call_count, 1)
+                with Repo(root / "test-org/survey.git") as destination:
+                    self.assertEqual(source.git.show_ref(), destination.git.show_ref())
+                    destination.git.update_ref(
+                        "refs/heads/destination-only", source.head.commit.hexsha
+                    )
+                # Destination-only changes also require a mirror push.
+                with patch.object(
+                    backup,
+                    "_push_repository_with_retry",
+                    wraps=backup._push_repository_with_retry,
+                ) as push:
+                    backup.run()
+                self.assertEqual(push.call_count, 1)
+                shutil.rmtree(root / "test-org/survey.git")
+                backup.run()
+                self.assertEqual(server.created, 2)
+                with Repo(root / "test-org/survey.git") as destination:
+                    self.assertEqual(source.git.show_ref(), destination.git.show_ref())
+                backup.gl.projects.get.assert_not_called()
                 # A failed fetch must not push stale refs or discard the local mirror.
                 backup.gitlab_token = "incorrect-source-token"
                 with (

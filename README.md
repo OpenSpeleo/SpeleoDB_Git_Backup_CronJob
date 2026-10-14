@@ -49,15 +49,26 @@ concurrently. Unset means `1`; empty, non-integer, zero, and negative values
 fail at startup before network calls. Higher counts increase CPU, memory, disk,
 and network usage.
 
-The main thread completes authentication, project discovery, and all GitLab
-metadata requests before starting backups. Workers receive immutable project
-records and independently clone/fetch, check or create their GOGS repository,
-and push. GitLab project IDs are deduplicated before metadata loading.
+The main thread authenticates and lists all repositories, including subgroups,
+with up to 100 repositories per page. The listing already contains the fields
+needed for backup: no per-project GitLab detail requests are made. It
+deduplicates project IDs and copies listing fields into immutable worker
+records, then starts the pool immediately.
+
+Each worker clones or fetches its mirror and ensures its GOGS destination
+exists. New local mirrors and newly created destinations are always pushed. For
+existing mirrors and destinations, the worker compares all local refs with GOGS
+using `git ls-remote --refs` and skips the push when they match. This detects
+changed, added, and deleted branches/tags, including destination-only changes.
+Comparing against GOGS also ensures a previously failed push is attempted again
+even when the next fetch changes nothing.
+
 Repository names are assumed unique (UUIDs in the configured source
 organization). Each worker owns its repository handles, temporary files,
 credentials, and HTTP request state; shared configuration is only read. The main
 thread collects results and reports failures after every backup finishes.
-Progress logs can interleave; failure summaries retain discovery order.
+Progress logs include listing, worker startup, clone/fetch, pushes, and
+unchanged repositories. Failure summaries retain discovery order.
 
 ## Troubleshooting
 
@@ -68,11 +79,11 @@ the updated script; the internal GOGS URL can keep its `http://` scheme.
 An authentication rejection with the updated script requires checking the GOGS
 username, access token, and repository permissions. Authentication failures are
 not retried. All GitLab API calls (including authentication and pagination),
-clones, fetches, and pushes retry transient failures at most five times after
-the initial attempt, waiting 2, 4, 8, 16, and 30 seconds. A failed fetch skips
-the destination push and retains the local mirror for the next run. An
-overlapping backup of the same local mirror fails that project instead of racing
-its refs.
+clones, fetches, ref comparisons, and pushes retry transient failures at most
+five times after the initial attempt, waiting 2, 4, 8, 16, and 30 seconds. A
+failed fetch skips the destination push and retains the local mirror for the
+next run. An overlapping backup of the same local mirror fails that project
+instead of racing its refs.
 
 ## Railway configuration
 
@@ -105,7 +116,7 @@ production credentials or `GIT_PROJECT_DIR` in the shell environment; tests
 supply their own temporary directories.
 
 Concurrency tests use bounded barriers and events to verify worker limits,
-metadata preparation, duplicate handling, and failure/retry isolation. The HTTP
+listing preparation, duplicate handling, and failure/retry isolation. The HTTP
 fixture also checks parallel initial and incremental backups of multiple
 repositories.
 

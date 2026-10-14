@@ -29,6 +29,54 @@ class PersistentBackupTests(unittest.TestCase):
             http_url_to_repo="https://gitlab.test/group/survey.git",
         )
 
+    def test_ref_comparison_covers_empty_tags_rewrites_and_deletions(self) -> None:
+        branch = "a" * 40 + "\trefs/heads/main"
+        tag = "b" * 40 + "\trefs/tags/v1"
+        rewritten = "c" * 40 + "\trefs/heads/main"
+        for local, remote, expected in (
+            ("", "", True),
+            (branch + "\n" + tag, tag + "\n" + branch, True),
+            (branch, rewritten, False),
+            (branch + "\n" + tag, branch, False),
+            (branch, branch + "\n" + tag, False),
+            ("", branch, False),
+            (branch, "", False),
+        ):
+            with self.subTest(local=local, remote=remote):
+                repo = MagicMock()
+                repo.git.for_each_ref.return_value = local
+                repo.git.ls_remote.return_value = remote
+                self.assertEqual(
+                    self.backup._destination_is_current(repo, self.project), expected
+                )
+                repo.git.ls_remote.assert_called_once_with(
+                    "--refs", self.backup._get_gogs_clone_url(self.project.name)
+                )
+
+    def test_ref_comparison_retries_and_never_pushes_on_failure(self) -> None:
+        repo = MagicMock()
+        repo.git.for_each_ref.return_value = ""
+        repo.git.ls_remote.side_effect = [
+            GitCommandError("git ls-remote", 128, stderr="HTTP 503"),
+            "",
+        ]
+        with patch("main.time.sleep") as sleep:
+            self.assertTrue(self.backup._destination_is_current(repo, self.project))
+        sleep.assert_called_once_with(2)
+        self.backup._repository_path(self.project).mkdir(parents=True)
+        repo.git.ls_remote.side_effect = GitCommandError(
+            "git ls-remote", 128, stderr="Authentication failed"
+        )
+        with (
+            patch.object(self.backup, "_clone_or_fetch_repository", return_value=repo),
+            patch.object(self.backup, "_check_gogs_repo_exists", return_value=True),
+            patch.object(self.backup, "_push_repository_with_retry") as push,
+            self.assertRaises(GitCommandError),
+        ):
+            self.backup._backup_repository(self.project)
+        push.assert_not_called()
+        repo.close.assert_called_once_with()
+
     def test_path_survives_rename_and_separates_instances_and_projects(self) -> None:
         original = self.backup._repository_path(self.project)
         self.project.name = "renamed"

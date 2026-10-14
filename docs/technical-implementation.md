@@ -22,11 +22,11 @@ Responsibilities are split into helper methods:
   - `_is_retryable_http_error()`
   - `_is_retryable_gitlab_error()`
   - `RetryingGitlab.http_request()`
-  - `_get_full_project_with_retry()`
   - `_is_retryable_git_error()`
   - `_clone_repository_with_retry()`
   - `_fetch_repository_with_retry()`
   - `_push_repository_with_retry()`
+  - `_destination_is_current()`
 - Backup orchestration:
   - `_repository_path()`
   - `_repository_lock()`
@@ -43,16 +43,18 @@ Responsibilities are split into helper methods:
 2. Authenticate against GitLab, with retry for transient API errors.
 3. Resolve GitLab group and list eligible projects, retrying each API request
    independently, including pagination requests.
-4. On the main thread, deduplicate project IDs, fetch all full project details
-   with retries, and copy backup inputs into frozen `BackupProject` records.
-   Record metadata failures without submitting those projects.
+4. On the main thread, deduplicate project IDs and copy listing fields directly
+   into frozen `BackupProject` records. No per-project GitLab requests are
+   needed. Invalid listing records fail only their project.
 5. Prepare the shared mirror parent directory and submit each prepared project
    to `ThreadPoolExecutor(max_workers=BACKUP_PARALLEL_THREADS)`. Each job:
    - Lock the project's persistent mirror for the entire fetch/push sequence.
    - Clone a missing mirror or fetch the existing mirror from GitLab (with retry
      for transient transport errors).
    - Ensure destination repo exists in GOGS.
-   - Push mirror refs to GOGS (with retry for transient transport errors).
+   - For existing mirrors and destinations, compare all refs with GOGS.
+   - Push new mirrors/destinations or changed refs, with retry for transient
+     transport errors. Log and skip the push when refs already match.
    - Check the push result for rejected refs before reporting success.
 6. On the main thread, collect completed futures with `as_completed()`, record
    successes and failures, and wait for executor shutdown.
@@ -75,9 +77,9 @@ GitPython repository/remotes, credential environment, and temporary directories.
 Workers do not change the process environment or working directory.
 
 Unique UUID project names in the configured source organization identify unique
-GOGS destinations. Repeated project IDs are skipped before metadata retrieval,
-so a local mirror is scheduled at most once. The existing nonblocking per-mirror
-file lock also protects against overlapping cron invocations using that mirror.
+GOGS destinations. Repeated project IDs are skipped before scheduling, so a
+local mirror is scheduled at most once. The existing nonblocking per-mirror file
+lock also protects against overlapping cron invocations using that mirror.
 
 Only the main thread submits futures, waits for their results, and updates
 result collections. Workers never wait on another job or submit nested work. A
@@ -89,8 +91,8 @@ servers.
 
 ## Retry model
 
-All GitLab and GOGS API requests and Git clone/fetch/push operations share
-`_retry_operation()`:
+All GitLab and GOGS API requests and Git clone/fetch/ref-comparison/push
+operations share `_retry_operation()`:
 
 - Base delay: 2 seconds; maximum delay: 30 seconds.
 - Delays: `2, 4, 8, 16, 30` seconds (60 seconds of waiting in total, plus the
@@ -107,22 +109,21 @@ All GitLab and GOGS API requests and Git clone/fetch/push operations share
 ### GitLab API retry
 
 `RetryingGitlab.http_request()` covers authentication, group lookup, project
-listing, every pagination request, and project detail lookup. It disables the
-SDK's own retries to prevent nested retry loops from exceeding the limit. A
-failed pagination request retries that page without replaying earlier pages.
-Requests have a 30-second timeout.
+listing, and every pagination request. It disables the SDK's own retries to
+prevent nested retry loops from exceeding the limit. A failed pagination request
+retries that page without replaying earlier pages. Requests have a 30-second
+timeout.
 
 Retryable failures include connection errors, timeouts, interrupted responses,
 and HTTP 408, 429, 500, 502, 503, 504, and 520–524. HTTP authentication and
 permission errors, malformed requests, and TLS certificate failures are
 terminal.
 
-`_get_full_project_with_retry()` handles a final request failure by skipping
-that project; it does not add another retry loop. Failures during authentication
-or group discovery end the run with a nonzero exit status. Expected API failures
-are logged with the exception type and HTTP status when available, without
-response bodies or tracebacks. Retry warnings also include this safe error
-summary, so a repeated 503 is visible before retries run out.
+Discovery failures end the run with a nonzero exit status. Listing requests use
+`per_page=100` and `simple=False`; group lookup uses `with_projects=False` to
+avoid fetching an unused embedded project list. Project fields needed for backup
+are already present in the paginated listing. Expected API failures are logged
+with the exception type and HTTP status, without response bodies or tracebacks.
 
 ### GOGS API retry
 
@@ -176,6 +177,20 @@ spans clone/fetch and push. Lock contention fails that project and processing
 continues; lock files remain, while OS locks release when the process exits.
 Mirrors for archived or removed projects remain on disk without further updates.
 
+### Skip unchanged pushes
+
+New local mirrors and newly created GOGS destinations are always pushed.
+Otherwise, compare the fetched mirror's `git for-each-ref` names/object IDs with
+GOGS `git ls-remote --refs`. Ignore ordering, symbolic HEAD, and peeled tag
+advertisements; compare the actual branch, tag, and other ref object IDs.
+Matching sets skip the push. Differences trigger a mirror push, including
+rewritten or deleted refs and destination-only refs. Empty ref sets are valid.
+
+Comparison uses task-local GOGS credentials and the existing transport retry
+policy. A failed comparison fails the project without pushing or claiming it is
+unchanged. No persistent success marker is needed: a failed or interrupted push
+still leaves different destination refs to detect on the next run.
+
 ### Push retry
 
 `_push_repository_with_retry()` checks `PushInfoList.raise_if_error()` so a
@@ -184,13 +199,13 @@ failures are retried; authentication and permission failures are terminal.
 
 ## Git authentication
 
-Clone, fetch, and push use a temporary `GIT_ASKPASS` shell helper with
-credentials supplied through the subprocess environment. The helper file
-contains no secrets and is removed after the operation. Terminal prompts and
-credential caching are disabled. Clone credentials are removed from the returned
-GitPython `Repo` environment before it is reused for the GOGS push. Repository
-URLs contain no credentials, including on failure paths. HTTP and HTTPS use the
-same mechanism. See
+Clone, fetch, ref comparison, and push use a temporary `GIT_ASKPASS` shell
+helper with credentials supplied through the subprocess environment. The helper
+file contains no secrets and is removed after the operation. Terminal prompts
+and credential caching are disabled. Clone credentials are removed from the
+returned GitPython `Repo` environment before it is reused for the GOGS push.
+Repository URLs contain no credentials, including on failure paths. HTTP and
+HTTPS use the same mechanism. See
 [Git credential handling](https://git-scm.com/docs/gitcredentials) and
 [GitPython push results](https://gitpython.readthedocs.io/en/stable/reference.html#git.remote.PushInfoList.raise_if_error).
 

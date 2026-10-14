@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-import gitlab
 import requests
 
 from main import BackupProject
@@ -52,7 +51,9 @@ class ParallelBackupTests(unittest.TestCase):
         self.backup.gl.groups.get.return_value.projects.list.return_value = (
             self.projects
         )
-        self.backup.gl.projects.get.side_effect = lambda idx: self.projects[idx]
+        self.backup.gl.projects.get.side_effect = AssertionError(
+            "Per-project GitLab requests are forbidden"
+        )
 
     def test_parallel_thread_configuration(self) -> None:
         for value, expected in ((None, 1), ("1", 1), ("4", 4), (" 2 ", 2)):
@@ -98,7 +99,7 @@ class ParallelBackupTests(unittest.TestCase):
             client.assert_not_called()
             request.assert_not_called()
 
-    def test_workers_overlap_within_limit_after_all_metadata_is_loaded(self) -> None:
+    def test_workers_overlap_within_limit_after_listing(self) -> None:
         for limit in (1, 2, 3, 8):
             with self.subTest(limit=limit):
                 self.check_parallel_limit(limit)
@@ -106,22 +107,24 @@ class ParallelBackupTests(unittest.TestCase):
     def check_parallel_limit(self, limit: int) -> None:
         main_thread = threading.get_ident()
         self.backup.parallel_threads = limit
-        loaded = []
+        listed = threading.Event()
         completed = []
         active = 0
         peak = 0
         lock = threading.Lock()
         barrier = threading.Barrier(min(limit, len(self.projects)), timeout=5)
 
-        def get_project(idx: int) -> SimpleNamespace:
+        def list_projects(**kwargs: object) -> list[SimpleNamespace]:
             self.assertEqual(threading.get_ident(), main_thread)
-            loaded.append(idx)
-            return self.projects[idx]
+            self.assertEqual(kwargs["per_page"], 100)
+            self.assertFalse(kwargs["simple"])
+            listed.set()
+            return self.projects
 
         def work(project: BackupProject) -> None:
             nonlocal active, peak
             self.assertNotEqual(threading.get_ident(), main_thread)
-            self.assertEqual(loaded, list(range(6)))
+            self.assertTrue(listed.is_set())
             self.assertIsInstance(project, BackupProject)
             self.assertTrue(self.backup._repository_path(project).parent.is_dir())
             with self.assertRaises(FrozenInstanceError):
@@ -136,7 +139,7 @@ class ParallelBackupTests(unittest.TestCase):
                     active -= 1
                     completed.append(project.id)
 
-        self.backup.gl.projects.get.side_effect = get_project
+        self.backup.gl.groups.get.return_value.projects.list.side_effect = list_projects
         with (
             patch.object(self.backup, "_backup_repository", new=work),
             self.assertLogs("main", level="INFO") as logs,
@@ -145,6 +148,7 @@ class ParallelBackupTests(unittest.TestCase):
         self.assertEqual(peak, min(limit, len(self.projects)))
         self.assertEqual(sorted(completed), list(range(6)))
         self.assertEqual(active, 0)
+        self.backup.gl.projects.get.assert_not_called()
         if limit == 1:
             self.assertEqual(completed, list(range(6)))
         summary = [r for r in logs.records if "Successful:" in r.getMessage()]
@@ -152,31 +156,26 @@ class ParallelBackupTests(unittest.TestCase):
         self.assertEqual(summary[0].thread, main_thread)
         self.assertIn("Successful: 6 repositories", summary[0].getMessage())
 
-    def test_metadata_is_detached_and_duplicates_are_scheduled_once(self) -> None:
-        self.backup.gl.groups.get.return_value.projects.list.return_value = [
-            self.projects[0],
-            self.projects[0],
-            self.projects[1],
-        ]
-
-        def get_project(idx: int) -> SimpleNamespace:
-            if idx == 1:
-                self.projects[0].description = "Changed SDK object"
-            return self.projects[idx]
-
-        self.backup.gl.projects.get.side_effect = get_project
+    def test_listing_is_detached_and_duplicates_are_scheduled_once(self) -> None:
+        prepared, failed = self.backup._prepare_projects(
+            [self.projects[0], self.projects[0], self.projects[1]]
+        )
+        self.projects[0].description = "Changed SDK object"
+        self.assertFalse(failed)
         with (
             patch.object(self.backup, "_backup_repository") as backup,
             self.assertLogs("main", level="INFO"),
         ):
-            self.backup.run()
-        self.assertEqual(self.backup.gl.projects.get.call_count, 2)
+            successful, failed = self.backup._backup_projects(prepared, 3)
+        self.assertEqual(len(successful), 2)
+        self.assertFalse(failed)
+        self.backup.gl.projects.get.assert_not_called()
         self.assertEqual(backup.call_count, 2)
         first = backup.call_args_list[0].args[0]
         self.assertEqual(first.description, "Test repository")
         self.assertIsNot(first, self.projects[0])
 
-    def test_empty_group_and_all_metadata_failures_do_not_start_pool(self) -> None:
+    def test_empty_group_and_invalid_listing_records_do_not_start_pool(self) -> None:
         for projects in ([], self.projects):
             with (
                 self.subTest(empty=not projects),
@@ -186,9 +185,8 @@ class ParallelBackupTests(unittest.TestCase):
                 self.backup.gl.groups.get.return_value.projects.list.return_value = (
                     projects
                 )
-                self.backup.gl.projects.get.side_effect = gitlab.GitlabGetError(
-                    "fixture", response_code=404
-                )
+                for project in projects:
+                    project.http_url_to_repo = "invalid-url"
                 if projects:
                     with self.assertRaises(SystemExit) as caught:
                         self.backup.run()
@@ -207,10 +205,7 @@ class ParallelBackupTests(unittest.TestCase):
         release_first = threading.Event()
         completions = []
 
-        def get_project(idx: int) -> SimpleNamespace:
-            if idx == 1:
-                raise gitlab.GitlabGetError("fixture", response_code=404)
-            return self.projects[idx]
+        self.projects[1].http_url_to_repo = "invalid-url"
 
         def work(project: BackupProject) -> None:
             if project.id == 0:
@@ -226,7 +221,6 @@ class ParallelBackupTests(unittest.TestCase):
                 if futures[future] == 2:
                     release_first.set()
 
-        self.backup.gl.projects.get.side_effect = get_project
         with (
             patch.object(self.backup, "_backup_repository", new=work),
             patch("main.as_completed", new=collect),

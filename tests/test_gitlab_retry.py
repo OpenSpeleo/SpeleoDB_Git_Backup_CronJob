@@ -16,7 +16,6 @@ from main import RetryingGitlab
 from main import _is_retryable_gitlab_error
 from main import _retry_operation
 from main import main
-from tests.test_backup import make_backup
 
 # Standard-library unittest assertions; no production credentials are used.
 # ruff: noqa: PT009, PT027, SLF001
@@ -107,7 +106,7 @@ class GitLabRetryTests(unittest.TestCase):
             self.assertNotIn(self.startup_environment["GITLAB_TOKEN"], output)
             self.assertNotIn(self.startup_environment["GOGS_ACCESS_TOKEN"], output)
 
-    def test_auth_group_listing_pages_and_project_details_retry(self) -> None:
+    def test_auth_group_and_listing_pages_retry(self) -> None:
         client = RetryingGitlab("https://gitlab.test", timeout=30)
         responses = [
             response(503, {}),
@@ -118,8 +117,6 @@ class GitLabRetryTests(unittest.TestCase):
             response(200, [{"id": 11}], next_page=True),
             response(504, {}),
             response(200, [{"id": 12}]),
-            response(500, {}),
-            response(200, {"id": 11, "name": "survey"}),
         ]
         with (
             patch.object(client.session, "request", side_effect=responses) as request,
@@ -130,11 +127,9 @@ class GitLabRetryTests(unittest.TestCase):
             projects = group.projects.list(
                 all=True, include_subgroups=True, archived=False
             )
-            project = client.projects.get(11)
         self.assertEqual([item.id for item in projects], [11, 12])
-        self.assertEqual(project.name, "survey")
-        self.assertEqual(request.call_count, 10)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2] * 5)
+        self.assertEqual(request.call_count, 8)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2] * 4)
         # Retry the failed second page without replaying the first page.
         for call in request.call_args_list[6:8]:
             self.assertEqual(call.kwargs["params"]["page"], ["2"])
@@ -201,20 +196,6 @@ class GitLabRetryTests(unittest.TestCase):
         ):
             client.auth()
         self.assertEqual(client.user.id, 1)
-        self.assertEqual(request.call_count, 6)
-        self.assertEqual(sleep.call_count, 5)
-
-    def test_project_failure_does_not_add_another_retry_loop(self) -> None:
-        backup = make_backup()
-        backup.gl = RetryingGitlab("https://gitlab.test")
-        with (
-            patch.object(
-                backup.gl.session, "request", return_value=response(503, {})
-            ) as request,
-            patch("main.time.sleep") as sleep,
-            self.assertLogs("main", level="WARNING"),
-        ):
-            self.assertIsNone(backup._get_full_project_with_retry(1, "group/survey"))
         self.assertEqual(request.call_count, 6)
         self.assertEqual(sleep.call_count, 5)
 

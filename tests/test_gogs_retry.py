@@ -134,7 +134,9 @@ class GOGSRetryTests(unittest.TestCase):
             response(503, {}),
         ):
             repos = [MagicMock(), MagicMock()]
-            backup.gl.projects.get.side_effect = projects
+            backup.gl.projects.get.side_effect = AssertionError(
+                "Unexpected detail request"
+            )
             with (
                 self.subTest(failure=failure),
                 tempfile.TemporaryDirectory() as directory,

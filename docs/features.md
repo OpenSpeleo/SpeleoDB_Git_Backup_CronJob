@@ -11,18 +11,19 @@
 - Makes upstream authoritative: accepts force pushes and moved tags, and prunes
   deleted branches, tags, and other refs before mirroring to GOGS.
 - Creates destination repositories in GOGS when missing.
-- Pushes all refs to GOGS with mirror push.
+- Mirror-pushes new repositories and changed refs; skips pushes when GOGS refs
+  match the fetched mirror.
 - Authenticates Git operations over HTTP and HTTPS without credentials in URLs.
 - Backs up independent repositories with a configurable thread pool. Set
   `BACKUP_PARALLEL_THREADS` to an integer >= 1; the default is `1`.
-- Completes all GitLab metadata loading on the main thread before workers start,
-  passing immutable project records to workers and collecting results centrally.
+- Lists repositories on the main thread with 100 results per page, uses listing
+  fields directly without per-project detail requests, and passes immutable
+  records to workers. Results are collected centrally.
 
 ## Reliability features
 
 - Retries transient failures on every GitLab API request, including
-  authentication, group lookup, project listing, pagination, and project
-  details.
+  authentication, group lookup, project listing, and pagination.
 - Retries transient GOGS API failures, including timeouts during repository
   checks, creation, and organization verification.
 - Retries transient git clone and fetch failures with exponential backoff.
@@ -31,7 +32,9 @@
   the persistent repository path.
 - Locks each local mirror through fetch and push to prevent overlapping runs
   from changing its refs concurrently.
-- Retries transient mirror push failures with exponential backoff.
+- Retries transient Git ref comparison and mirror push failures with exponential
+  backoff. Comparing against GOGS ensures a previous failed push is attempted
+  again even if the next fetch changes nothing.
 - Uses at most five retries per operation, delayed by 2, 4, 8, 16, and 30
   seconds.
 - Treats rejected pushes as failures and avoids retrying authentication errors.

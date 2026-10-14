@@ -226,7 +226,7 @@ class BackupTests(unittest.TestCase):
         ]
         backup.gl = MagicMock()
         backup.gl.groups.get.return_value.projects.list.return_value = projects
-        backup.gl.projects.get.side_effect = projects
+        backup.gl.projects.get.side_effect = AssertionError("Unexpected detail request")
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(

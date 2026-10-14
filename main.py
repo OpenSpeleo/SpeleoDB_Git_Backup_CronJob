@@ -219,22 +219,6 @@ class GitLabToGOGSBackup:
         if self.gogs_org:
             self._verify_gogs_org_exists()
 
-    def _get_full_project_with_retry(
-        self, project_id: int, project_display_name: str
-    ) -> Any | None:
-        """Fetch project details; the GitLab client owns the request retry budget."""
-        try:
-            return self.gl.projects.get(project_id)
-        except (gitlab.GitlabError, requests.exceptions.RequestException) as error:
-            logger.error(  # noqa: TRY400 - expected API failure, no response body
-                "Failed to load project details for '%s' (id=%s): %s. "
-                "Skipping project.",
-                project_display_name,
-                project_id,
-                _request_error_summary(error),
-            )
-            return None
-
     def _is_retryable_git_error(self, error: Exception) -> bool:
         """Determine whether a Git transport error appears transient."""
         if not isinstance(error, GitCommandError):
@@ -573,18 +557,46 @@ class GitLabToGOGSBackup:
                 retries,
             )
 
+    def _destination_is_current(self, repo: Repo, project: BackupProject) -> bool:
+        """Compare all refs with GOGS, including tags and deleted branches."""
+        local_refs = set(
+            repo.git.for_each_ref("--format=%(objectname)%09%(refname)").splitlines()
+        )
+        with (
+            self._git_credentials(self.gogs_username, self.gogs_token) as env,
+            repo.git.custom_environment(**env),
+        ):
+            remote_refs = _retry_operation(
+                lambda: repo.git.ls_remote(
+                    "--refs", self._get_gogs_clone_url(project.name)
+                ),
+                f"Git ref comparison for {project.name}",
+                self._is_retryable_git_error,
+            )
+        return local_refs == set(remote_refs.splitlines())
+
     def _backup_repository(self, project: BackupProject) -> None:
         """Backup a single repository from GitLab to GOGS."""
         repo_path = self._repository_path(project)
         with self._repository_lock(repo_path):
             repo: Repo | None = None
             try:
+                is_new = not repo_path.exists()
                 repo = self._clone_or_fetch_repository(project, repo_path)
 
                 # Check if repo exists in GOGS, create if not
-                if not self._check_gogs_repo_exists(project.name):
+                destination_exists = self._check_gogs_repo_exists(project.name)
+                if not destination_exists:
                     logger.info(f"Creating repository {project.name} in GOGS...")
                     self._create_gogs_repo(project)
+
+                if (
+                    not is_new
+                    and destination_exists
+                    and self._destination_is_current(repo, project)
+                ):
+                    logger.info("No ref changes for %s; skipping push", project.name)
+                    return
 
                 # Keep origin pointing at GitLab for the next incremental fetch.
                 gogs_url = self._get_gogs_clone_url(project.name)
@@ -610,7 +622,7 @@ class GitLabToGOGSBackup:
     def _prepare_projects(
         self, projects: list[Any]
     ) -> tuple[dict[int, BackupProject], dict[int, tuple[str, str]]]:
-        """Load all metadata on the calling thread before any backups start."""
+        """Copy listing data into immutable worker inputs without network calls."""
         prepared: dict[int, BackupProject] = {}
         failed: dict[int, tuple[str, str]] = {}
         seen_ids: set[int] = set()
@@ -625,22 +637,15 @@ class GitLabToGOGSBackup:
                 or getattr(project, "name", None)
                 or str(project_id)
             )
-            full_project = self._get_full_project_with_retry(project_id, display_name)
-            if full_project is None:
-                failed[idx] = (
-                    display_name,
-                    "Failed to load project details after retries",
-                )
-                continue
             try:
                 prepared[idx] = BackupProject(
                     id=project_id,
-                    name=full_project.name,
-                    path_with_namespace=full_project.path_with_namespace,
-                    description=full_project.description or "",
-                    visibility=full_project.visibility,
+                    name=project.name,
+                    path_with_namespace=project.path_with_namespace,
+                    description=project.description or "",
+                    visibility=project.visibility,
                     http_url_to_repo=self._validate_http_url(
-                        full_project.http_url_to_repo, "GitLab repository URL"
+                        project.http_url_to_repo, "GitLab repository URL"
                     ),
                 )
             except Exception as error:
@@ -671,6 +676,11 @@ class GitLabToGOGSBackup:
         self._repository_path(first_project).parent.mkdir(parents=True, exist_ok=True)
         # Workers only read configuration. Repo handles, HTTP sessions, temporary
         # paths, and Git environments are created inside each individual job.
+        logger.info(
+            "Starting up to %s backup workers for %s repositories",
+            self.parallel_threads,
+            len(projects),
+        )
         with ThreadPoolExecutor(
             max_workers=self.parallel_threads, thread_name_prefix="backup"
         ) as executor:
@@ -700,12 +710,15 @@ class GitLabToGOGSBackup:
     def run(self) -> None:
         """Prepare on the main thread, back up independently, then report results."""
         try:
-            group = self.gl.groups.get(self.gitlab_group_id)
+            group = self.gl.groups.get(self.gitlab_group_id, with_projects=False)
             logger.info("Found GitLab group: %s", group.name)
+            logger.info("Listing GitLab repositories (including subgroups)...")
             projects = group.projects.list(
                 all=True,
                 include_subgroups=True,
                 archived=False,
+                simple=False,
+                per_page=100,
             )
             logger.info("Found %s projects to backup", len(projects))
 

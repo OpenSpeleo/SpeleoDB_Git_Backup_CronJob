@@ -12,16 +12,18 @@ GitLab group (including subgroups) into a GOGS instance.
 
 - Authenticates to GitLab using a personal access token.
 - Lists all eligible repositories from the configured GitLab group.
-- Fetches full project details before backup.
-- Loads all GitLab metadata on the main thread, then backs up repositories in
+- Uses repository fields from the group listing without per-project API
+  requests.
+- Lists GitLab repositories on the main thread, then backs up repositories in
   independent workers using `BACKUP_PARALLEL_THREADS` (integer >= 1, default 1).
 - Shares only read-only configuration and frozen project records with workers;
   the main thread collects backup results.
 - Clones each repository as a mirror.
 - Creates missing destination repositories in GOGS.
-- Pushes all refs/tags/branches to GOGS using mirror push.
+- Pushes new mirrors/destinations and changed refs to GOGS using mirror push;
+  skips unchanged destinations after comparing refs.
 - Tracks successes and failures and exits non-zero when failures exist.
-- Retries transient GitLab project-detail API failures with exponential backoff.
+- Retries transient GitLab discovery API failures with exponential backoff.
 - Retries transient Git clone failures with exponential backoff.
 
 ## Temporary agent files
@@ -47,7 +49,7 @@ files.
 - Main entrypoint: `main.py`.
 - Main orchestration class: `GitLabToGOGSBackup`.
 - Network + API responsibilities:
-  - GitLab: group/project discovery and project detail retrieval.
+  - GitLab: group/project discovery.
   - GOGS: repository existence checks and repo creation.
 - Git operations:
   - Clone from GitLab using `Repo.clone_from(..., mirror=True)`.
