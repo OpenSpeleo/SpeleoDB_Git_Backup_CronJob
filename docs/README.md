@@ -2,8 +2,9 @@
 
 This directory contains project documentation for the backup job.
 
-- [Railway configuration](../.railway/README.md) - infrastructure migration,
-  preserved service settings, and the plan/apply workflow.
+- [Git backup and Gogs operations](https://github.com/OpenSpeleo/SpeleoDB/blob/master/docs/git-backup-operations.md) -
+  shared Railway configuration, memory tuning, preserved service settings, and
+  the plan/apply workflow in the web repository.
 
 - `features.md` - functional behavior and capabilities.
 - `technical-implementation.md` - architecture, control flow, and failure model.

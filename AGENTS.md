@@ -46,6 +46,13 @@ files.
 
 ## Technical implementation snapshot
 
+Railway infrastructure lives exclusively in the web repository's
+`.railway/railway.ts` (`apps/web/.railway/railway.ts` in the monorepo),
+including this job, Gogs, and their volumes. Do not create a separate IaC file
+or SDK here. Use the web repository's plan/apply workflow; deploying backup
+application code does not apply infrastructure changes. See the Railway section
+in `README.md`.
+
 - Main entrypoint: `main.py`.
 - Main orchestration class: `GitLabToGOGSBackup`.
 - Network + API responsibilities:

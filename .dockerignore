@@ -212,5 +212,5 @@ __marimo__/
 .pycache
 .uv
 
-# Railway IaC is evaluated locally, not by the Python application image.
+# Legacy local IaC dependencies are not part of the backup application image.
 .railway/

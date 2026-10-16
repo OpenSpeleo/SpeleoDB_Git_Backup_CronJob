@@ -87,16 +87,24 @@ instead of racing its refs.
 
 ## Railway configuration
 
-[`.railway/railway.ts`](.railway/railway.ts) manages the backup service using
-Railway Infrastructure as Code, including its Dockerfile build and 15-minute
-cron schedule. Existing variable values stay in Railway through `preserve()`.
+[The shared Railway configuration](https://github.com/OpenSpeleo/SpeleoDB/blob/master/.railway/railway.ts)
+manages the backup service and its Gogs destination. It lives in
+`apps/web/.railway/railway.ts` in the monorepo, alongside the application
+service definitions under the `SpeleoDB-Prod` named partial. Production runs
+hourly, with one repository backup at a time and bounded Git packing buffers.
+Gogs uses a 32 MiB soft Go memory target, more frequent garbage collection, and
+a smaller database connection pool. These settings do not cap filesystem cache
+or change the services' hard memory limits. Credentials and existing storage
+settings stay in Railway through `preserve()` and the existing volume
+declarations.
 
-Install the configuration SDK with `npm ci --prefix .railway`, link this
-directory to the production backup service, and run `railway config plan`. Apply
-reviewed changes with `railway config apply`; deploying application code alone
-does not apply IaC changes. See
-[the Railway configuration guide](.railway/README.md) for the complete workflow
-and official documentation.
+Run `railway config plan --environment production` from the web repository,
+using its Bun-managed SDK. Apply reviewed changes there with
+`railway config apply --environment production`; deploying application code
+alone does not apply IaC changes. Do not add a separate configuration or SDK to
+this repository. See
+[Git backup and Gogs operations](https://github.com/OpenSpeleo/SpeleoDB/blob/master/docs/git-backup-operations.md)
+for the complete workflow and official documentation.
 
 ## Validation
 
